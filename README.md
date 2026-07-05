@@ -28,6 +28,8 @@ for atomic multi-instance claims.
 - Pure deterministic replay over event history for workflow-visible completion,
   timer, activity-result, and signal state.
 - Idempotent external workflow signals, keyed by workflow id and signal id.
+- Durable update-style request/response messages with pending, completed,
+  rejected, and failed states.
 - Query APIs that replay workflow-visible state from durable history.
 - History compaction into a replayable snapshot event for long-running
   workflows.
@@ -47,15 +49,15 @@ preservation, durable timers, retries, timeouts, and worker polling. This
 library implements a smaller reusable foundation: durable state, atomic claims,
 task-queue filtering, leases, heartbeats, recovery, ordered event history,
 deterministic replay, activity-result preservation, durable timers, retry
-backoff, idempotent signals, query-state replay, cancellation, nested child
-workflows, history compaction, and visibility.
+backoff, idempotent signals, durable updates, query-state replay, cancellation,
+nested child workflows, history compaction, and visibility.
 
 Temporal still has a broader production platform surface: dedicated frontend,
-history, matching, and worker services; mature SDK workflow runners; updates;
-advanced visibility; archival; multi-cluster operation; and managed cloud
-options. Use this library when Poster needs an embedded OCaml workflow
-foundation over its existing Mongo deployment. Use Temporal when the system
-needs the full external orchestration platform.
+history, matching, and worker services; mature SDK workflow runners; advanced
+visibility; archival; multi-cluster operation; and managed cloud options. Use
+this library when Poster needs an embedded OCaml workflow foundation over its
+existing Mongo deployment. Use Temporal when the system needs the full external
+orchestration platform.
 
 ## Minimal Example
 

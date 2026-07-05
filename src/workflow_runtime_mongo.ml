@@ -12,6 +12,7 @@ type t = {
   timers_collection : string;
   signals_collection : string;
   child_workflows_collection : string;
+  updates_collection : string;
 }
 
 let create ~client ~db ~collection () =
@@ -24,6 +25,7 @@ let create ~client ~db ~collection () =
     timers_collection = collection ^ "_timers";
     signals_collection = collection ^ "_signals";
     child_workflows_collection = collection ^ "_child_workflows";
+    updates_collection = collection ^ "_updates";
   }
 
 let error_to_string = function
@@ -47,6 +49,7 @@ let capabilities _ =
       history_compaction = true;
       cancellation = true;
       child_workflows = true;
+      updates = true;
     }
 
 let mongo_error error = `Mongo (Mongo_error.to_string error)
@@ -128,6 +131,20 @@ type child_workflow_doc = {
   child_workflow_id : string;
   child_kind : string;
   started_at_ms : int64;
+}
+[@@deriving bson]
+
+type workflow_update_doc = {
+  id : string; [@bson.key "_id"]
+  update_id : string;
+  workflow_id : string;
+  name : string;
+  payload_json : string option;
+  status : string;
+  result_json : string option;
+  error : string option;
+  requested_at_ms : int64;
+  completed_at_ms : int64 option;
 }
 [@@deriving bson]
 
@@ -341,6 +358,43 @@ let child_of_doc (doc : child_workflow_doc) =
       started_at_ms = doc.started_at_ms;
     }
 
+let update_key ~workflow_id ~update_id = workflow_id ^ ":" ^ update_id
+
+let update_doc_of_update (update : Workflow_runtime.workflow_update) =
+  ({
+     id = update_key ~workflow_id:update.workflow_id ~update_id:update.update_id;
+     update_id = update.update_id;
+     workflow_id = update.workflow_id;
+     name = update.name;
+     payload_json = update.payload_json;
+     status = Workflow_runtime.update_status_to_string update.status;
+     result_json = update.result_json;
+     error = update.error;
+     requested_at_ms = update.requested_at_ms;
+     completed_at_ms = update.completed_at_ms;
+   }
+    : workflow_update_doc)
+
+let update_of_doc (doc : workflow_update_doc) =
+  let ( let* ) = Result.bind in
+  let* status =
+    Workflow_runtime.update_status_of_string doc.status
+    |> Result.map_error (fun message -> `Bad_document message)
+  in
+  Ok
+    Workflow_runtime.
+      {
+        update_id = doc.update_id;
+        workflow_id = doc.workflow_id;
+        name = doc.name;
+        payload_json = doc.payload_json;
+        status;
+        result_json = doc.result_json;
+        error = doc.error;
+        requested_at_ms = doc.requested_at_ms;
+        completed_at_ms = doc.completed_at_ms;
+      }
+
 let decode_workflow_doc bson =
   match workflow_doc_of_bson_doc_result bson with
   | Error message -> Error (`Bad_document message)
@@ -375,6 +429,11 @@ let decode_child bson =
   match child_workflow_doc_of_bson_doc_result bson with
   | Error message -> Error (`Bad_document message)
   | Ok doc -> Ok (child_of_doc doc)
+
+let decode_update bson =
+  match workflow_update_doc_of_bson_doc_result bson with
+  | Error message -> Error (`Bad_document message)
+  | Ok doc -> update_of_doc doc
 
 let index_key fields =
   Bson.add_element "key" (Bson.create_doc_element (doc fields)) Bson.empty
@@ -444,6 +503,13 @@ let ensure t =
       [ Mongo_index.Name "workflow_child_id_idx"; Mongo_index.Unique true ]
     |> Result.map_error mongo_error
   in
+  let* () =
+    Mongo_eio.direct_ensure_index t.client ~db:t.db
+      ~collection:t.updates_collection
+      (index_key [ int32 "workflow_id" 1; int32 "update_id" 1 ])
+      [ Mongo_index.Name "workflow_update_id_idx"; Mongo_index.Unique true ]
+    |> Result.map_error mongo_error
+  in
   Ok ()
 
 let event_id ~workflow_id ~sequence = workflow_id ^ ":" ^ string_of_int sequence
@@ -507,6 +573,9 @@ let signal_payload (signal : Workflow_runtime.signal) =
 
 let child_workflow_payload (child : Workflow_runtime.child_workflow) =
   Workflow_runtime.child_workflow_to_yojson child |> Yojson.Safe.to_string
+
+let update_payload (update : Workflow_runtime.workflow_update) =
+  Workflow_runtime.workflow_update_to_yojson update |> Yojson.Safe.to_string
 
 let non_terminal_status_filter =
   doc_element "status"
@@ -1090,6 +1159,30 @@ let signals ~workflow_id t =
         (Ok []) docs
       |> Result.map List.rev
 
+let updates ~workflow_id t =
+  let filter = doc [ string "workflow_id" workflow_id ] in
+  let opts =
+    {
+      (Mongo_crud.default_find t.updates_collection filter) with
+      sort = Some (doc [ int32 "requested_at_ms" 1; int32 "update_id" 1 ]);
+    }
+  in
+  Mongo_eio.direct_find t.client ~db:t.db ~collection:t.updates_collection opts
+  |> Result.map_error mongo_error
+  |> function
+  | Error _ as error -> error
+  | Ok docs ->
+      List.fold_left
+        (fun acc bson ->
+          match acc with
+          | Error _ as error -> error
+          | Ok updates -> (
+              match decode_update bson with
+              | Ok update -> Ok (update :: updates)
+              | Error _ as error -> error))
+        (Ok []) docs
+      |> Result.map List.rev
+
 let query_state ~workflow_id t =
   let ( let* ) = Result.bind in
   let* events = history ~workflow_id t in
@@ -1357,6 +1450,137 @@ let start_child t ~parent_workflow_id ~worker_id ~now_ms
           |> Result.map_error mongo_error
         in
         ensure_child_started_event t ~parent_workflow_id ~worker_id child
+
+let request_update t ~workflow_id ~now_ms ~update_id ~name ?payload_json () =
+  let ( let* ) = Result.bind in
+  let* workflow_exists =
+    Mongo_eio.direct_find_one t.client ~db:t.db
+      ~collection:t.workflows_collection
+      (doc [ string "_id" workflow_id; non_terminal_status_filter ])
+    |> Result.map_error mongo_error
+    |> Result.map Option.is_some
+  in
+  if not workflow_exists then Ok false
+  else
+    let update =
+      Workflow_runtime.
+        {
+          update_id;
+          workflow_id;
+          name;
+          payload_json;
+          status = Update_pending;
+          result_json = None;
+          error = None;
+          requested_at_ms = now_ms;
+          completed_at_ms = None;
+        }
+    in
+    let update_doc = update_doc_of_update update in
+    let* write =
+      Mongo_eio.direct_update_one t.client ~db:t.db
+        ~collection:t.updates_collection ~upsert:true
+        (doc [ string "_id" update_doc.id ])
+        (doc [ doc_element "$setOnInsert" (workflow_update_doc_to_bson_doc update_doc) ])
+      |> Result.map_error mongo_error
+    in
+    if write.Mongo_crud.upserted_ids = [] then Ok true
+    else
+      let query = doc [ string "_id" workflow_id; non_terminal_status_filter ] in
+      let workflow_update =
+        doc
+          [
+            doc_element "$set"
+              (doc
+                 [
+                   string "status" (Workflow_runtime.status_to_string Queued);
+                   string "message" ("update: " ^ name);
+                   int64 "updated_at_ms" now_ms;
+                 ]);
+            doc_element "$min" (doc [ int64 "run_at_ms" now_ms ]);
+            doc_element "$inc" (doc [ int32 "event_sequence" 1 ]);
+            doc_element "$unset"
+              (doc [ string "lease_owner" ""; string "lease_expires_at_ms" "" ]);
+          ]
+      in
+      find_and_modify t ~query ~update:workflow_update
+      |> function
+      | Error _ as error -> error
+      | Ok None -> Ok false
+      | Ok (Some (_item, sequence)) ->
+          append_event t ~workflow_id ~sequence
+            ~kind:Workflow_runtime.Update_requested
+            ~payload_json:(update_payload update) ~message:name
+            ~occurred_at_ms:now_ms ()
+          |> Result.map (fun () -> true)
+
+let complete_update t ~workflow_id ~worker_id ~now_ms ~update_id ~status
+    ?result_json ?error () =
+  match status with
+  | Workflow_runtime.Update_pending ->
+      Error (`Bad_document "complete_update requires a terminal update status")
+  | Update_completed_status | Update_rejected | Update_failed ->
+      let ( let* ) = Result.bind in
+      let* owned =
+        Mongo_eio.direct_find_one t.client ~db:t.db
+          ~collection:t.workflows_collection
+          (owned_query ~workflow_id ~worker_id)
+        |> Result.map_error mongo_error
+        |> Result.map Option.is_some
+      in
+      if not owned then Ok false
+      else
+        let id = update_key ~workflow_id ~update_id in
+        let* current =
+          Mongo_eio.direct_find_one t.client ~db:t.db
+            ~collection:t.updates_collection
+            (doc [ string "_id" id ])
+          |> Result.map_error mongo_error
+          |> function
+          | Error _ as error -> error
+          | Ok None -> Ok None
+          | Ok (Some bson) -> decode_update bson |> Result.map Option.some
+        in
+        match current with
+        | None -> Ok false
+        | Some existing when existing.Workflow_runtime.status <> Update_pending ->
+            Ok true
+        | Some existing ->
+            let completed =
+              Workflow_runtime.
+                {
+                  existing with
+                  status;
+                  result_json;
+                  error;
+                  completed_at_ms = Some now_ms;
+                }
+            in
+            let completed_doc = update_doc_of_update completed in
+            let* _ =
+              Mongo_eio.direct_update_one t.client ~db:t.db
+                ~collection:t.updates_collection ~upsert:false
+                (doc [ string "_id" id ])
+                (doc
+                   [
+                     doc_element "$set"
+                       (workflow_update_doc_to_bson_doc completed_doc);
+                   ])
+              |> Result.map_error mongo_error
+            in
+            let workflow_update =
+              doc [ doc_element "$inc" (doc [ int32 "event_sequence" 1 ]) ]
+            in
+            update_owned t ~workflow_id ~worker_id workflow_update
+            |> function
+            | Error _ as error -> error
+            | Ok None -> Ok false
+            | Ok (Some sequence) ->
+                append_event t ~workflow_id ~sequence
+                  ~kind:Workflow_runtime.Update_completed ~worker_id
+                  ~payload_json:(update_payload completed) ?message:error
+                  ~occurred_at_ms:now_ms ()
+                |> Result.map (fun () -> true)
 
 let record_activity_result t ~now_ms (result : Workflow_runtime.activity_result) =
   let result = { result with Workflow_runtime.updated_at_ms = now_ms } in

@@ -62,6 +62,7 @@ type backend_capabilities = {
   history_compaction : bool;
   cancellation : bool;
   child_workflows : bool;
+  updates : bool;
 }
 
 type event_kind =
@@ -80,6 +81,8 @@ type event_kind =
   | History_compacted
   | Workflow_cancelled
   | Child_workflow_started
+  | Update_requested
+  | Update_completed
 
 type event = {
   id : string;
@@ -130,6 +133,24 @@ type child_workflow = {
   started_at_ms : int64;
 }
 
+type update_status =
+  | Update_pending
+  | Update_completed_status
+  | Update_rejected
+  | Update_failed
+
+type workflow_update = {
+  update_id : string;
+  workflow_id : string;
+  name : string;
+  payload_json : string option;
+  status : update_status;
+  result_json : string option;
+  error : string option;
+  requested_at_ms : int64;
+  completed_at_ms : int64 option;
+}
+
 type retry_policy = {
   max_attempts : int;
   initial_backoff_ms : int64;
@@ -173,6 +194,7 @@ type replay_state = {
   activities : replay_activity list;
   signals : signal list;
   child_workflows : child_workflow list;
+  updates : workflow_update list;
   compacted_at_sequence : int option;
 }
 
@@ -193,12 +215,15 @@ val event_kind_to_string : event_kind -> string
 val event_kind_of_string : string -> (event_kind, string) result
 val activity_status_to_string : activity_status -> string
 val activity_status_of_string : string -> (activity_status, string) result
+val update_status_to_string : update_status -> string
+val update_status_of_string : string -> (update_status, string) result
 val item_to_yojson : item -> Yojson.Safe.t
 val event_to_yojson : event -> Yojson.Safe.t
 val activity_result_to_yojson : activity_result -> Yojson.Safe.t
 val timer_to_yojson : timer -> Yojson.Safe.t
 val signal_to_yojson : signal -> Yojson.Safe.t
 val child_workflow_to_yojson : child_workflow -> Yojson.Safe.t
+val workflow_update_to_yojson : workflow_update -> Yojson.Safe.t
 val replay_state_to_yojson : replay_state -> Yojson.Safe.t
 val items_to_yojson : ?group_by_tenant:bool -> item list -> Yojson.Safe.t
 val stats : item list -> stats
@@ -303,11 +328,34 @@ module type BACKEND = sig
     enqueue_options ->
     (bool, error) result
 
+  val request_update :
+    t ->
+    workflow_id:string ->
+    now_ms:int64 ->
+    update_id:string ->
+    name:string ->
+    ?payload_json:string ->
+    unit ->
+    (bool, error) result
+
+  val complete_update :
+    t ->
+    workflow_id:string ->
+    worker_id:string ->
+    now_ms:int64 ->
+    update_id:string ->
+    status:update_status ->
+    ?result_json:string ->
+    ?error:string ->
+    unit ->
+    (bool, error) result
+
   val snapshot : ?tenant_id:string -> t -> (item list, error) result
   val children : parent_workflow_id:string -> t -> (item list, error) result
   val history : workflow_id:string -> t -> (event list, error) result
   val timers : workflow_id:string -> t -> (timer list, error) result
   val signals : workflow_id:string -> t -> (signal list, error) result
+  val updates : workflow_id:string -> t -> (workflow_update list, error) result
   val query_state : workflow_id:string -> t -> (replay_state option, error) result
   val compact_history : workflow_id:string -> t -> (int option, error) result
 
@@ -413,12 +461,33 @@ module type S = sig
     enqueue_options ->
     (bool, error) result
 
+  val request_update :
+    backend ->
+    workflow_id:string ->
+    update_id:string ->
+    name:string ->
+    ?payload_json:string ->
+    unit ->
+    (bool, error) result
+
+  val complete_update :
+    backend ->
+    workflow_id:string ->
+    worker_id:string ->
+    update_id:string ->
+    status:update_status ->
+    ?result_json:string ->
+    ?error:string ->
+    unit ->
+    (bool, error) result
+
   val snapshot : ?tenant_id:string -> backend -> (item list, error) result
   val children : parent_workflow_id:string -> backend -> (item list, error) result
   val snapshot_json : ?tenant_id:string -> ?group_by_tenant:bool -> backend -> (Yojson.Safe.t, error) result
   val history : workflow_id:string -> backend -> (event list, error) result
   val timers : workflow_id:string -> backend -> (timer list, error) result
   val signals : workflow_id:string -> backend -> (signal list, error) result
+  val updates : workflow_id:string -> backend -> (workflow_update list, error) result
   val query_state : workflow_id:string -> backend -> (replay_state option, error) result
   val compact_history : workflow_id:string -> backend -> (int option, error) result
 

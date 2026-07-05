@@ -775,6 +775,122 @@ let test_mongo_child_workflows_can_nest_across_backend_instances () =
       Alcotest.(check int) "child replay child count" 1
         (List.length child_state.child_workflows))
 
+let test_mongo_updates_survive_backend_instances () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let config =
+    Mongo_config.
+      {
+        (default ~host ~port ~database:db ()) with
+        direct_connection = true;
+        server_selection_timeout_ms = 2_000;
+        connect_timeout_ms = 2_000;
+        socket_timeout_ms = Some 5_000;
+        app_name = Some "workflow-runtime-e2e";
+      }
+  in
+  let client =
+    match
+      Mongo_eio.connect ~sw ~net:(Eio.Stdenv.net env)
+        ~clock:(Eio.Stdenv.clock env) ~config
+    with
+    | Ok client -> client
+    | Error error ->
+        Alcotest.fail ("connect: " ^ Mongo_error.to_string error)
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      let _ =
+        Mongo_eio.direct_run_command client db
+          [ ("dropDatabase", Bson.create_int32 1l) ]
+      in
+      Mongo_eio.close_direct client)
+    (fun () ->
+      let backend_a =
+        Workflow_runtime_mongo.create ~client ~db ~collection:"update_workflows" ()
+      in
+      let backend_b =
+        Workflow_runtime_mongo.create ~client ~db ~collection:"update_workflows" ()
+      in
+      Workflow_runtime_mongo.ensure backend_a |> expect_ok "ensure";
+      let capabilities = Workflow_runtime_mongo.capabilities backend_a in
+      Alcotest.(check bool) "updates" true capabilities.updates;
+      Workflow_runtime_mongo.enqueue backend_a ~now_ms:9_000L
+        (workflow "wf_update")
+        (Workflow_runtime.enqueue_options ~run_at_ms:10_000L ())
+      |> expect_ok "enqueue";
+      Workflow_runtime_mongo.request_update backend_b ~workflow_id:"wf_update"
+        ~now_ms:9_001L ~update_id:"upd_accept" ~name:"change_target"
+        ~payload_json:{|{"target":"blog"}|} ()
+      |> expect_ok "request update"
+      |> Alcotest.(check bool) "update requested" true;
+      Workflow_runtime_mongo.request_update backend_a ~workflow_id:"wf_update"
+        ~now_ms:9_002L ~update_id:"upd_accept" ~name:"change_target"
+        ~payload_json:{|{"target":"blog"}|} ()
+      |> expect_ok "duplicate request update"
+      |> Alcotest.(check bool) "duplicate update idempotent" true;
+      Workflow_runtime_mongo.request_update backend_b ~workflow_id:"wf_update"
+        ~now_ms:9_003L ~update_id:"upd_reject" ~name:"set_bad_target"
+        ~payload_json:{|{"target":""}|} ()
+      |> expect_ok "request rejected update"
+      |> Alcotest.(check bool) "second update requested" true;
+      let claim =
+        Workflow_runtime_mongo.claim_workflow backend_a ~workflow_id:"wf_update"
+          ~worker_id:"worker_a" ~now_ms:9_004L ~lease_ms:10_000L
+        |> expect_ok "claim"
+        |> Option.get
+      in
+      Alcotest.(check string) "claimed update workflow" "wf_update"
+        claim.item.workflow.id;
+      Workflow_runtime_mongo.complete_update backend_a ~workflow_id:"wf_update"
+        ~worker_id:"worker_a" ~now_ms:9_005L ~update_id:"upd_accept"
+        ~status:Workflow_runtime.Update_completed_status
+        ~result_json:{|{"accepted":true}|} ()
+      |> expect_ok "complete update"
+      |> Alcotest.(check bool) "update completed" true;
+      Workflow_runtime_mongo.complete_update backend_a ~workflow_id:"wf_update"
+        ~worker_id:"worker_a" ~now_ms:9_006L ~update_id:"upd_reject"
+        ~status:Workflow_runtime.Update_rejected ~error:"target required" ()
+      |> expect_ok "reject update"
+      |> Alcotest.(check bool) "update rejected" true;
+      let updates =
+        Workflow_runtime_mongo.updates ~workflow_id:"wf_update" backend_b
+        |> expect_ok "updates"
+      in
+      Alcotest.(check int) "two updates" 2 (List.length updates);
+      let accepted =
+        updates
+        |> List.find (fun update ->
+               String.equal update.Workflow_runtime.update_id "upd_accept")
+      in
+      Alcotest.(check string) "accepted status" "completed"
+        (Workflow_runtime.update_status_to_string accepted.status);
+      Alcotest.(check (option string)) "accepted result"
+        (Some {|{"accepted":true}|})
+        accepted.result_json;
+      let rejected =
+        updates
+        |> List.find (fun update ->
+               String.equal update.Workflow_runtime.update_id "upd_reject")
+      in
+      Alcotest.(check string) "rejected status" "rejected"
+        (Workflow_runtime.update_status_to_string rejected.status);
+      Alcotest.(check (option string)) "rejected error"
+        (Some "target required") rejected.error;
+      let state =
+        Workflow_runtime_mongo.query_state ~workflow_id:"wf_update" backend_a
+        |> expect_ok "query state"
+        |> Option.get
+      in
+      Alcotest.(check int) "replay update count" 2
+        (List.length state.updates);
+      Workflow_runtime_mongo.complete_update backend_a ~workflow_id:"wf_update"
+        ~worker_id:"worker_a" ~now_ms:9_007L ~update_id:"upd_accept"
+        ~status:Workflow_runtime.Update_completed_status
+        ~result_json:{|{"accepted":true}|} ()
+      |> expect_ok "duplicate complete update"
+      |> Alcotest.(check bool) "duplicate completion idempotent" true)
+
 let () =
   Mirage_crypto_rng_unix.use_default ();
   Alcotest.run "workflow-runtime-mongo"
@@ -798,5 +914,7 @@ let () =
           Alcotest.test_case "child workflows can nest across backend instances"
             `Quick
             test_mongo_child_workflows_can_nest_across_backend_instances;
+          Alcotest.test_case "updates survive backend instances" `Quick
+            test_mongo_updates_survive_backend_instances;
         ] );
     ]

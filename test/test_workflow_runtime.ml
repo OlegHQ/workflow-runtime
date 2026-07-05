@@ -553,6 +553,67 @@ let test_child_workflows_can_nest_and_replay () =
   Alcotest.(check int) "child replay child count" 1
     (List.length child_state.child_workflows)
 
+let test_updates_are_durable_and_replayable () =
+  let now = ref 50_000L in
+  let module Runtime =
+    Workflow_runtime.Make (struct
+      let now_ms () =
+        let value = !now in
+        now := Int64.add value 1L;
+        value
+    end) (Workflow_runtime.Memory_backend)
+  in
+  let backend = Workflow_runtime.Memory_backend.create () in
+  let capabilities = Runtime.capabilities backend in
+  Alcotest.(check bool) "updates" true capabilities.updates;
+  Runtime.enqueue backend (workflow "update_wf") (Workflow_runtime.enqueue_options ())
+  |> expect_ok "enqueue";
+  Runtime.request_update backend ~workflow_id:"update_wf" ~update_id:"upd_1"
+    ~name:"change_target" ~payload_json:{|{"target":"blog"}|} ()
+  |> expect_ok "request update"
+  |> Alcotest.(check bool) "update requested" true;
+  Runtime.request_update backend ~workflow_id:"update_wf" ~update_id:"upd_1"
+    ~name:"change_target" ~payload_json:{|{"target":"blog"}|} ()
+  |> expect_ok "duplicate request update"
+  |> Alcotest.(check bool) "duplicate update idempotent" true;
+  let claim =
+    Runtime.claim_workflow backend ~workflow_id:"update_wf" ~worker_id:"worker_a"
+      ~lease_ms:10_000L
+    |> expect_ok "claim"
+    |> Option.get
+  in
+  Alcotest.(check string) "claimed update workflow" "update_wf"
+    claim.item.workflow.id;
+  Runtime.complete_update backend ~workflow_id:"update_wf" ~worker_id:"worker_a"
+    ~update_id:"upd_1" ~status:Workflow_runtime.Update_completed_status
+    ~result_json:{|{"accepted":true}|} ()
+  |> expect_ok "complete update"
+  |> Alcotest.(check bool) "update completed" true;
+  let updates =
+    Runtime.updates backend ~workflow_id:"update_wf" |> expect_ok "updates"
+  in
+  Alcotest.(check int) "one update" 1 (List.length updates);
+  let update = List.hd updates in
+  Alcotest.(check string) "update status" "completed"
+    (Workflow_runtime.update_status_to_string update.status);
+  Alcotest.(check (option string)) "update result"
+    (Some {|{"accepted":true}|})
+    update.result_json;
+  let state =
+    Runtime.query_state backend ~workflow_id:"update_wf"
+    |> expect_ok "query state"
+    |> Option.get
+  in
+  Alcotest.(check int) "replay update count" 1 (List.length state.updates);
+  let replayed = List.hd state.updates in
+  Alcotest.(check string) "replay update status" "completed"
+    (Workflow_runtime.update_status_to_string replayed.status);
+  Runtime.complete_update backend ~workflow_id:"update_wf" ~worker_id:"worker_a"
+    ~update_id:"upd_1" ~status:Workflow_runtime.Update_completed_status
+    ~result_json:{|{"accepted":true}|} ()
+  |> expect_ok "duplicate complete update"
+  |> Alcotest.(check bool) "duplicate completion idempotent" true
+
 let test_grouping_filtering_and_reschedule () =
   let now = ref 10L in
   let module Runtime =
@@ -639,6 +700,8 @@ let () =
             test_cancellation_is_terminal_and_replayable;
           Alcotest.test_case "child workflows can nest and replay" `Quick
             test_child_workflows_can_nest_and_replay;
+          Alcotest.test_case "updates are durable and replayable" `Quick
+            test_updates_are_durable_and_replayable;
           Alcotest.test_case "grouping filtering and reschedule" `Quick
             test_grouping_filtering_and_reschedule;
           Alcotest.test_case "validation" `Quick test_validation;
