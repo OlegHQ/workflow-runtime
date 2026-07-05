@@ -5,7 +5,7 @@
     production backend must implement atomic [claim_next] semantics so multiple
     worker processes cannot claim the same workflow concurrently. *)
 
-type status = Queued | Running | Succeeded | Blocked | Failed
+type status = Queued | Running | Succeeded | Blocked | Failed | Cancelled
 
 type workflow = {
   id : string;
@@ -45,6 +45,7 @@ type stats = {
   succeeded : int;
   blocked : int;
   failed : int;
+  cancelled : int;
 }
 
 type backend_capabilities = {
@@ -59,6 +60,7 @@ type backend_capabilities = {
   signals : bool;
   queries : bool;
   history_compaction : bool;
+  cancellation : bool;
 }
 
 type event_kind =
@@ -75,6 +77,7 @@ type event_kind =
   | Timer_fired
   | Signal_received
   | History_compacted
+  | Workflow_cancelled
 
 type event = {
   id : string;
@@ -273,6 +276,13 @@ module type BACKEND = sig
     unit ->
     (bool, error) result
 
+  val cancel :
+    t ->
+    workflow_id:string ->
+    now_ms:int64 ->
+    reason:string ->
+    (bool, error) result
+
   val snapshot : ?tenant_id:string -> t -> (item list, error) result
   val history : workflow_id:string -> t -> (event list, error) result
   val timers : workflow_id:string -> t -> (timer list, error) result
@@ -366,6 +376,12 @@ module type S = sig
     name:string ->
     ?payload_json:string ->
     unit ->
+    (bool, error) result
+
+  val cancel :
+    backend ->
+    workflow_id:string ->
+    reason:string ->
     (bool, error) result
 
   val snapshot : ?tenant_id:string -> backend -> (item list, error) result

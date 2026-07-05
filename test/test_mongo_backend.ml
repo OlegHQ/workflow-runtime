@@ -577,6 +577,103 @@ let test_mongo_signals_queries_and_compaction_across_backend_instances () =
       Alcotest.(check string) "claimed after signal" "wf_signal"
         claim.Workflow_runtime.item.workflow.id)
 
+let test_mongo_cancellation_across_backend_instances () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let config =
+    Mongo_config.
+      {
+        (default ~host ~port ~database:db ()) with
+        direct_connection = true;
+        server_selection_timeout_ms = 2_000;
+        connect_timeout_ms = 2_000;
+        socket_timeout_ms = Some 5_000;
+        app_name = Some "workflow-runtime-e2e";
+      }
+  in
+  let client =
+    match
+      Mongo_eio.connect ~sw ~net:(Eio.Stdenv.net env)
+        ~clock:(Eio.Stdenv.clock env) ~config
+    with
+    | Ok client -> client
+    | Error error ->
+        Alcotest.fail ("connect: " ^ Mongo_error.to_string error)
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      let _ =
+        Mongo_eio.direct_run_command client db
+          [ ("dropDatabase", Bson.create_int32 1l) ]
+      in
+      Mongo_eio.close_direct client)
+    (fun () ->
+      let backend_a =
+        Workflow_runtime_mongo.create ~client ~db ~collection:"cancel_workflows" ()
+      in
+      let backend_b =
+        Workflow_runtime_mongo.create ~client ~db ~collection:"cancel_workflows" ()
+      in
+      Workflow_runtime_mongo.ensure backend_a |> expect_ok "ensure";
+      let capabilities = Workflow_runtime_mongo.capabilities backend_a in
+      Alcotest.(check bool) "cancellation" true capabilities.cancellation;
+      Workflow_runtime_mongo.enqueue backend_a ~now_ms:7_000L
+        (workflow "wf_cancel")
+        (Workflow_runtime.enqueue_options ~run_at_ms:7_000L ())
+      |> expect_ok "enqueue";
+      Workflow_runtime_mongo.claim_workflow backend_a ~workflow_id:"wf_cancel"
+        ~worker_id:"worker_a" ~now_ms:7_001L ~lease_ms:60_000L
+      |> expect_ok "claim"
+      |> Option.get
+      |> ignore;
+      Workflow_runtime_mongo.cancel backend_b ~workflow_id:"wf_cancel"
+        ~now_ms:7_002L ~reason:"user requested stop"
+      |> expect_ok "cancel"
+      |> Alcotest.(check bool) "cancelled" true;
+      Workflow_runtime_mongo.cancel backend_a ~workflow_id:"wf_cancel"
+        ~now_ms:7_003L ~reason:"duplicate"
+      |> expect_ok "cancel duplicate"
+      |> Alcotest.(check bool) "duplicate ignored" false;
+      Alcotest.(check bool)
+        "cancelled workflow is not claimable" true
+        (Workflow_runtime_mongo.claim_workflow backend_a ~workflow_id:"wf_cancel"
+           ~worker_id:"worker_b" ~now_ms:7_004L ~lease_ms:10_000L
+         |> expect_ok "claim after cancel"
+         |> Option.is_none);
+      Workflow_runtime_mongo.signal backend_b ~workflow_id:"wf_cancel"
+        ~now_ms:7_005L ~signal_id:"late_signal" ~name:"resume" ()
+      |> expect_ok "signal after cancel"
+      |> Alcotest.(check bool) "signal rejected" false;
+      let snapshot =
+        Workflow_runtime_mongo.snapshot backend_b |> expect_ok "snapshot"
+      in
+      let item = List.hd snapshot in
+      Alcotest.(check string) "cancelled status" "cancelled"
+        (Workflow_runtime.status_to_string item.status);
+      Alcotest.(check int) "cancelled stat" 1
+        (Workflow_runtime.stats snapshot).cancelled;
+      let history =
+        Workflow_runtime_mongo.history ~workflow_id:"wf_cancel" backend_a
+        |> expect_ok "history"
+      in
+      Alcotest.(check (list string))
+        "cancel history"
+        [ "workflow_enqueued"; "workflow_claimed"; "workflow_cancelled" ]
+        (List.map
+           (fun event ->
+             Workflow_runtime.event_kind_to_string event.Workflow_runtime.kind)
+           history);
+      let state =
+        Workflow_runtime_mongo.query_state ~workflow_id:"wf_cancel" backend_b
+        |> expect_ok "query state"
+        |> Option.get
+      in
+      let completion = Option.get state.Workflow_runtime.completion in
+      Alcotest.(check string) "replay status" "cancelled"
+        (Workflow_runtime.status_to_string completion.status);
+      Alcotest.(check (option string)) "replay reason"
+        (Some "user requested stop") completion.message)
+
 let () =
   Mirage_crypto_rng_unix.use_default ();
   Alcotest.run "workflow-runtime-mongo"
@@ -595,5 +692,7 @@ let () =
           Alcotest.test_case
             "signals queries and compaction across backend instances" `Quick
             test_mongo_signals_queries_and_compaction_across_backend_instances;
+          Alcotest.test_case "cancellation across backend instances" `Quick
+            test_mongo_cancellation_across_backend_instances;
         ] );
     ]

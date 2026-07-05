@@ -43,6 +43,7 @@ let capabilities _ =
       signals = true;
       queries = true;
       history_compaction = true;
+      cancellation = true;
     }
 
 let mongo_error error = `Mongo (Mongo_error.to_string error)
@@ -453,6 +454,26 @@ let signal_payload (signal : Workflow_runtime.signal) =
       ("signal_id", `String signal.signal_id);
       ("name", `String signal.name);
       ("payload_json", string_option_json signal.payload_json);
+    ]
+  |> Yojson.Safe.to_string
+
+let non_terminal_status_filter =
+  doc_element "status"
+    (doc
+       [
+         ( "$in",
+           Bson.create_list
+             [
+               Bson.create_string (Workflow_runtime.status_to_string Queued);
+               Bson.create_string (Workflow_runtime.status_to_string Running);
+             ] );
+       ])
+
+let cancel_payload ~reason =
+  `Assoc
+    [
+      ("status", `String (Workflow_runtime.status_to_string Cancelled));
+      ("message", string_option_json (Some reason));
     ]
   |> Yojson.Safe.to_string
 
@@ -1029,7 +1050,7 @@ let signal t ~workflow_id ~now_ms ~signal_id ~name ?payload_json () =
   let* workflow_exists =
     Mongo_eio.direct_find_one t.client ~db:t.db
       ~collection:t.workflows_collection
-      (doc [ string "_id" workflow_id ])
+      (doc [ string "_id" workflow_id; non_terminal_status_filter ])
     |> Result.map_error mongo_error
     |> Result.map Option.is_some
   in
@@ -1053,7 +1074,7 @@ let signal t ~workflow_id ~now_ms ~signal_id ~name ?payload_json () =
     in
     if signal_write.Mongo_crud.upserted_ids = [] then Ok true
     else
-      let query = doc [ string "_id" workflow_id ] in
+      let query = doc [ string "_id" workflow_id; non_terminal_status_filter ] in
       let update =
         doc
           [
@@ -1080,6 +1101,35 @@ let signal t ~workflow_id ~now_ms ~signal_id ~name ?payload_json () =
             ~payload_json:(signal_payload signal) ~message:name
             ~occurred_at_ms:now_ms ()
           |> Result.map (fun () -> true)
+
+let cancel t ~workflow_id ~now_ms ~reason =
+  let query = doc [ string "_id" workflow_id; non_terminal_status_filter ] in
+  let update =
+    doc
+      [
+        doc_element "$set"
+          (doc
+             [
+               string "status" (Workflow_runtime.status_to_string Cancelled);
+               int64 "finished_at_ms" now_ms;
+               string "message" reason;
+               int64 "updated_at_ms" now_ms;
+             ]);
+        doc_element "$inc" (doc [ int32 "event_sequence" 1 ]);
+        doc_element "$unset"
+          (doc [ string "lease_owner" ""; string "lease_expires_at_ms" "" ]);
+      ]
+  in
+  find_and_modify t ~query ~update
+  |> function
+  | Error _ as error -> error
+  | Ok None -> Ok false
+  | Ok (Some (_item, sequence)) ->
+      append_event t ~workflow_id ~sequence
+        ~kind:Workflow_runtime.Workflow_cancelled
+        ~payload_json:(cancel_payload ~reason) ~message:reason
+        ~occurred_at_ms:now_ms ()
+      |> Result.map (fun () -> true)
 
 let record_activity_result t ~now_ms (result : Workflow_runtime.activity_result) =
   let result = { result with Workflow_runtime.updated_at_ms = now_ms } in

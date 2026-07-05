@@ -1,4 +1,4 @@
-type status = Queued | Running | Succeeded | Blocked | Failed
+type status = Queued | Running | Succeeded | Blocked | Failed | Cancelled
 
 type workflow = {
   id : string;
@@ -38,6 +38,7 @@ type stats = {
   succeeded : int;
   blocked : int;
   failed : int;
+  cancelled : int;
 }
 
 type backend_capabilities = {
@@ -52,6 +53,7 @@ type backend_capabilities = {
   signals : bool;
   queries : bool;
   history_compaction : bool;
+  cancellation : bool;
 }
 
 type event_kind =
@@ -68,6 +70,7 @@ type event_kind =
   | Timer_fired
   | Signal_received
   | History_compacted
+  | Workflow_cancelled
 
 type event = {
   id : string;
@@ -178,6 +181,7 @@ let status_to_string = function
   | Succeeded -> "succeeded"
   | Blocked -> "blocked"
   | Failed -> "failed"
+  | Cancelled -> "cancelled"
 
 let status_of_string = function
   | "queued" -> Ok Queued
@@ -185,6 +189,7 @@ let status_of_string = function
   | "succeeded" -> Ok Succeeded
   | "blocked" -> Ok Blocked
   | "failed" -> Ok Failed
+  | "cancelled" -> Ok Cancelled
   | value -> Error ("unknown workflow status: " ^ value)
 
 let event_kind_to_string = function
@@ -201,6 +206,7 @@ let event_kind_to_string = function
   | Timer_fired -> "timer_fired"
   | Signal_received -> "signal_received"
   | History_compacted -> "history_compacted"
+  | Workflow_cancelled -> "workflow_cancelled"
 
 let event_kind_of_string = function
   | "workflow_enqueued" -> Ok Workflow_enqueued
@@ -216,6 +222,7 @@ let event_kind_of_string = function
   | "timer_fired" -> Ok Timer_fired
   | "signal_received" -> Ok Signal_received
   | "history_compacted" -> Ok History_compacted
+  | "workflow_cancelled" -> Ok Workflow_cancelled
   | value -> Error ("unknown workflow event kind: " ^ value)
 
 let activity_status_to_string = function
@@ -607,6 +614,18 @@ let replay_event state (event : event) =
           completion =
             Some { status; message; completed_at_ms = event.occurred_at_ms };
         }
+  | Workflow_cancelled ->
+      Ok
+        {
+          state with
+          completion =
+            Some
+              {
+                status = Cancelled;
+                message = event.message;
+                completed_at_ms = event.occurred_at_ms;
+              };
+        }
   | Timer_scheduled ->
       let ( let* ) = Result.bind in
       let* json = payload_json event in
@@ -719,7 +738,15 @@ let replay events =
   with Invalid_argument message -> Error message
 
 let empty_stats =
-  { total = 0; queued = 0; running = 0; succeeded = 0; blocked = 0; failed = 0 }
+  {
+    total = 0;
+    queued = 0;
+    running = 0;
+    succeeded = 0;
+    blocked = 0;
+    failed = 0;
+    cancelled = 0;
+  }
 
 let stats (items : item list) =
   List.fold_left
@@ -732,7 +759,9 @@ let stats (items : item list) =
           { stats with total = stats.total + 1; succeeded = stats.succeeded + 1 }
       | Blocked ->
           { stats with total = stats.total + 1; blocked = stats.blocked + 1 }
-      | Failed -> { stats with total = stats.total + 1; failed = stats.failed + 1 })
+      | Failed -> { stats with total = stats.total + 1; failed = stats.failed + 1 }
+      | Cancelled ->
+          { stats with total = stats.total + 1; cancelled = stats.cancelled + 1 })
     empty_stats items
 
 let stats_json stats =
@@ -744,6 +773,7 @@ let stats_json stats =
       ("succeeded", `Int stats.succeeded);
       ("blocked", `Int stats.blocked);
       ("failed", `Int stats.failed);
+      ("cancelled", `Int stats.cancelled);
     ]
 
 let items_to_yojson ?(group_by_tenant = false) (items : item list) =
@@ -857,6 +887,13 @@ module type BACKEND = sig
     unit ->
     (bool, error) result
 
+  val cancel :
+    t ->
+    workflow_id:string ->
+    now_ms:int64 ->
+    reason:string ->
+    (bool, error) result
+
   val snapshot : ?tenant_id:string -> t -> (item list, error) result
   val history : workflow_id:string -> t -> (event list, error) result
   val timers : workflow_id:string -> t -> (timer list, error) result
@@ -952,6 +989,12 @@ module type S = sig
     unit ->
     (bool, error) result
 
+  val cancel :
+    backend ->
+    workflow_id:string ->
+    reason:string ->
+    (bool, error) result
+
   val snapshot : ?tenant_id:string -> backend -> (item list, error) result
   val snapshot_json : ?tenant_id:string -> ?group_by_tenant:bool -> backend -> (Yojson.Safe.t, error) result
   val history : workflow_id:string -> backend -> (event list, error) result
@@ -990,6 +1033,8 @@ module Make (Clock : CLOCK) (Backend : BACKEND) = struct
   let signal backend ~workflow_id ~signal_id ~name ?payload_json () =
     Backend.signal backend ~workflow_id ~now_ms:(Clock.now_ms ()) ~signal_id
       ~name ?payload_json ()
+  let cancel backend ~workflow_id ~reason =
+    Backend.cancel backend ~workflow_id ~now_ms:(Clock.now_ms ()) ~reason
   let snapshot = Backend.snapshot
   let history = Backend.history
   let timers = Backend.timers
@@ -1055,6 +1100,7 @@ module Memory_backend = struct
       signals = true;
       queries = true;
       history_compaction = true;
+      cancellation = true;
     }
 
   let activity_key ~workflow_id ~activity_id = workflow_id ^ "\000" ^ activity_id
@@ -1120,7 +1166,7 @@ module Memory_backend = struct
     &&
     match item.status with
     | Queued | Running -> lease_available ~now_ms item
-    | Blocked | Succeeded | Failed -> false
+    | Blocked | Succeeded | Failed | Cancelled -> false
 
   let kind_matches kind (item : item) =
     match kind with
@@ -1267,7 +1313,7 @@ module Memory_backend = struct
         | _ -> Ok false)
 
   let terminal_status = function
-    | Succeeded | Blocked | Failed -> true
+    | Succeeded | Blocked | Failed | Cancelled -> true
     | Queued | Running -> false
 
   let complete t ~workflow_id ~worker_id ~now_ms ~status ~message =
@@ -1438,6 +1484,7 @@ module Memory_backend = struct
     with_lock t (fun () ->
         match Hashtbl.find_opt t.records workflow_id with
         | None -> Ok false
+        | Some record when terminal_status record.item.status -> Ok false
         | Some record ->
             let key = signal_key ~workflow_id ~signal_id in
             if Hashtbl.mem t.signals key then Ok true
@@ -1460,6 +1507,27 @@ module Memory_backend = struct
             append_event record ~workflow_id ~kind:Signal_received
               ~payload_json:(signal_payload signal) ~message:name
               ~occurred_at_ms:now_ms t;
+            Ok true)
+
+  let cancel t ~workflow_id ~now_ms ~reason =
+    with_lock t (fun () ->
+        match Hashtbl.find_opt t.records workflow_id with
+        | None -> Ok false
+        | Some record when terminal_status record.item.status -> Ok false
+        | Some record ->
+            let item = record.item in
+            record.item <-
+              {
+                item with
+                status = Cancelled;
+                lease_owner = None;
+                lease_expires_at_ms = None;
+                finished_at_ms = Some now_ms;
+                message = Some reason;
+                updated_at_ms = now_ms;
+              };
+            append_event record ~workflow_id ~kind:Workflow_cancelled
+              ~message:reason ~occurred_at_ms:now_ms t;
             Ok true)
 
   let record_activity_result t ~now_ms (result : activity_result) =

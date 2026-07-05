@@ -15,6 +15,8 @@ for atomic multi-instance claims.
 - Worker heartbeats to extend active leases.
 - Lease expiry recovery after worker/process crashes.
 - Terminal completion as `succeeded`, `blocked`, or `failed`.
+- Durable cancellation as `cancelled`, including active lease release and a
+  replayable `workflow_cancelled` audit event.
 - Durable reschedule back to `queued`.
 - Append-only ordered workflow event history for audit and replay inputs.
 - Activity result recording and lookup so retried workflow code can preserve
@@ -42,15 +44,15 @@ preservation, durable timers, retries, timeouts, and worker polling. This
 library implements a smaller reusable foundation: durable state, atomic claims,
 task-queue filtering, leases, heartbeats, recovery, ordered event history,
 deterministic replay, activity-result preservation, durable timers, retry
-backoff, idempotent signals, query-state replay, history compaction, and
-visibility.
+backoff, idempotent signals, query-state replay, cancellation, history
+compaction, and visibility.
 
 Temporal still has a broader production platform surface: dedicated frontend,
 history, matching, and worker services; mature SDK workflow runners; updates;
-cancellation; child workflows; advanced visibility; archival; multi-cluster
-operation; and managed cloud options. Use this library when Poster needs an
-embedded OCaml workflow foundation over its existing Mongo deployment. Use
-Temporal when the system needs the full external orchestration platform.
+child workflows; advanced visibility; archival; multi-cluster operation; and
+managed cloud options. Use this library when Poster needs an embedded OCaml
+workflow foundation over its existing Mongo deployment. Use Temporal when the
+system needs the full external orchestration platform.
 
 ## Minimal Example
 
