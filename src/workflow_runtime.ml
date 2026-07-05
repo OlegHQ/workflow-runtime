@@ -40,6 +40,15 @@ type stats = {
   failed : int;
 }
 
+type backend_capabilities = {
+  durable : bool;
+  multi_worker_claims : bool;
+  event_history : bool;
+  activity_results : bool;
+  task_queue_filtering : bool;
+  retry_backoff : bool;
+}
+
 type event_kind =
   | Workflow_enqueued
   | Workflow_claimed
@@ -77,8 +86,32 @@ type activity_result = {
   updated_at_ms : int64;
 }
 
+type retry_policy = {
+  max_attempts : int;
+  initial_backoff_ms : int64;
+  max_backoff_ms : int64;
+  backoff_multiplier : float;
+}
+
+type retry_decision =
+  | Retried of { attempt : int; run_at_ms : int64 }
+  | Retries_exhausted of { attempt : int }
+
 let enqueue_options ?(run_at_ms = 0L) ?payload_json () =
   { run_at_ms; payload_json }
+
+let retry_policy ?(max_attempts = 3) ?(initial_backoff_ms = 1_000L)
+    ?(max_backoff_ms = 300_000L) ?(backoff_multiplier = 2.0) () =
+  { max_attempts; initial_backoff_ms; max_backoff_ms; backoff_multiplier }
+
+let retry_delay_ms policy ~attempt =
+  let exponent = max 0 (attempt - 1) in
+  let multiplier = policy.backoff_multiplier ** float_of_int exponent in
+  let delay =
+    Int64.to_float policy.initial_backoff_ms *. multiplier
+    |> Float.round |> Int64.of_float
+  in
+  min delay policy.max_backoff_ms
 
 let status_to_string = function
   | Queued -> "queued"
@@ -260,10 +293,12 @@ module type BACKEND = sig
   type error
 
   val error_to_string : error -> string
+  val capabilities : t -> backend_capabilities
   val ensure : t -> (unit, error) result
   val enqueue : t -> now_ms:int64 -> workflow -> enqueue_options -> (unit, error) result
 
   val claim_next :
+    ?kind:string ->
     t ->
     worker_id:string ->
     now_ms:int64 ->
@@ -303,6 +338,15 @@ module type BACKEND = sig
     run_at_ms:int64 ->
     message:string ->
     (bool, error) result
+
+  val retry :
+    t ->
+    workflow_id:string ->
+    worker_id:string ->
+    now_ms:int64 ->
+    policy:retry_policy ->
+    message:string ->
+    (retry_decision option, error) result
 
   val snapshot : ?tenant_id:string -> t -> (item list, error) result
   val history : workflow_id:string -> t -> (event list, error) result
@@ -326,10 +370,12 @@ module type S = sig
   type error
 
   val error_to_string : error -> string
+  val capabilities : backend -> backend_capabilities
   val ensure : backend -> (unit, error) result
   val enqueue : backend -> workflow -> enqueue_options -> (unit, error) result
 
   val claim_next :
+    ?kind:string ->
     backend ->
     worker_id:string ->
     lease_ms:int64 ->
@@ -365,6 +411,14 @@ module type S = sig
     message:string ->
     (bool, error) result
 
+  val retry :
+    backend ->
+    workflow_id:string ->
+    worker_id:string ->
+    policy:retry_policy ->
+    message:string ->
+    (retry_decision option, error) result
+
   val snapshot : ?tenant_id:string -> backend -> (item list, error) result
   val snapshot_json : ?tenant_id:string -> ?group_by_tenant:bool -> backend -> (Yojson.Safe.t, error) result
   val history : workflow_id:string -> backend -> (event list, error) result
@@ -384,13 +438,15 @@ module Make (Clock : CLOCK) (Backend : BACKEND) = struct
   type error = Backend.error
 
   let error_to_string = Backend.error_to_string
+  let capabilities = Backend.capabilities
   let ensure = Backend.ensure
   let enqueue backend workflow options = Backend.enqueue backend ~now_ms:(Clock.now_ms ()) workflow options
-  let claim_next backend ~worker_id ~lease_ms = Backend.claim_next backend ~worker_id ~now_ms:(Clock.now_ms ()) ~lease_ms
+  let claim_next ?kind backend ~worker_id ~lease_ms = Backend.claim_next ?kind backend ~worker_id ~now_ms:(Clock.now_ms ()) ~lease_ms
   let claim_workflow backend ~workflow_id ~worker_id ~lease_ms = Backend.claim_workflow backend ~workflow_id ~worker_id ~now_ms:(Clock.now_ms ()) ~lease_ms
   let heartbeat backend ~workflow_id ~worker_id ~lease_ms = Backend.heartbeat backend ~workflow_id ~worker_id ~now_ms:(Clock.now_ms ()) ~lease_ms
   let complete backend ~workflow_id ~worker_id ~status ~message = Backend.complete backend ~workflow_id ~worker_id ~now_ms:(Clock.now_ms ()) ~status ~message
   let reschedule backend ~workflow_id ~worker_id ~run_at_ms ~message = Backend.reschedule backend ~workflow_id ~worker_id ~now_ms:(Clock.now_ms ()) ~run_at_ms ~message
+  let retry backend ~workflow_id ~worker_id ~policy ~message = Backend.retry backend ~workflow_id ~worker_id ~now_ms:(Clock.now_ms ()) ~policy ~message
   let snapshot = Backend.snapshot
   let history = Backend.history
   let record_activity_result backend result =
@@ -435,6 +491,15 @@ module Memory_backend = struct
     Fun.protect f ~finally:(fun () -> Mutex.unlock t.mutex)
 
   let ensure _ = Ok ()
+  let capabilities _ =
+    {
+      durable = false;
+      multi_worker_claims = false;
+      event_history = true;
+      activity_results = true;
+      task_queue_filtering = true;
+      retry_backoff = true;
+    }
 
   let activity_key ~workflow_id ~activity_id = workflow_id ^ "\000" ^ activity_id
 
@@ -499,11 +564,17 @@ module Memory_backend = struct
     | Queued | Running -> lease_available ~now_ms item
     | Blocked | Succeeded | Failed -> false
 
-  let claim_next t ~worker_id ~now_ms ~lease_ms =
+  let kind_matches kind (item : item) =
+    match kind with
+    | None -> true
+    | Some kind -> String.equal item.workflow.kind kind
+
+  let claim_next ?kind t ~worker_id ~now_ms ~lease_ms =
     with_lock t (fun () ->
         let candidate =
           t.records |> Hashtbl.to_seq_values |> List.of_seq
-          |> List.filter (fun record -> claimable ~now_ms record.item)
+          |> List.filter (fun record ->
+                 claimable ~now_ms record.item && kind_matches kind record.item)
           |> List.sort (fun a b ->
                  let by_run = Int64.compare a.item.run_at_ms b.item.run_at_ms in
                  if by_run <> 0 then by_run
@@ -626,6 +697,45 @@ module Memory_backend = struct
               ~worker_id ~message ~occurred_at_ms:now_ms t;
             Ok true
         | _ -> Ok false)
+
+  let retry t ~workflow_id ~worker_id ~now_ms ~policy ~message =
+    with_lock t (fun () ->
+        match Hashtbl.find_opt t.records workflow_id with
+        | Some record when owned_by record.item worker_id ->
+            let item = record.item in
+            if item.attempt >= policy.max_attempts then (
+              record.item <-
+                {
+                  item with
+                  status = Failed;
+                  lease_owner = None;
+                  lease_expires_at_ms = None;
+                  finished_at_ms = Some now_ms;
+                  message = Some message;
+                  updated_at_ms = now_ms;
+                };
+              append_event record ~workflow_id ~kind:Workflow_completed
+                ~worker_id ~message ~occurred_at_ms:now_ms t;
+              Ok (Some (Retries_exhausted { attempt = item.attempt })))
+            else
+              let run_at_ms =
+                Int64.add now_ms (retry_delay_ms policy ~attempt:item.attempt)
+              in
+              record.item <-
+                {
+                  item with
+                  status = Queued;
+                  run_at_ms;
+                  lease_owner = None;
+                  lease_expires_at_ms = None;
+                  finished_at_ms = None;
+                  message = Some message;
+                  updated_at_ms = now_ms;
+                };
+              append_event record ~workflow_id ~kind:Workflow_rescheduled
+                ~worker_id ~message ~occurred_at_ms:now_ms t;
+              Ok (Some (Retried { attempt = item.attempt; run_at_ms }))
+        | _ -> Ok None)
 
   let snapshot ?tenant_id t =
     with_lock t (fun () ->

@@ -47,6 +47,15 @@ type stats = {
   failed : int;
 }
 
+type backend_capabilities = {
+  durable : bool;
+  multi_worker_claims : bool;
+  event_history : bool;
+  activity_results : bool;
+  task_queue_filtering : bool;
+  retry_backoff : bool;
+}
+
 type event_kind =
   | Workflow_enqueued
   | Workflow_claimed
@@ -84,8 +93,27 @@ type activity_result = {
   updated_at_ms : int64;
 }
 
+type retry_policy = {
+  max_attempts : int;
+  initial_backoff_ms : int64;
+  max_backoff_ms : int64;
+  backoff_multiplier : float;
+}
+
+type retry_decision =
+  | Retried of { attempt : int; run_at_ms : int64 }
+  | Retries_exhausted of { attempt : int }
+
 val enqueue_options :
   ?run_at_ms:int64 -> ?payload_json:string -> unit -> enqueue_options
+
+val retry_policy :
+  ?max_attempts:int ->
+  ?initial_backoff_ms:int64 ->
+  ?max_backoff_ms:int64 ->
+  ?backoff_multiplier:float ->
+  unit ->
+  retry_policy
 
 val status_to_string : status -> string
 val status_of_string : string -> (status, string) result
@@ -98,16 +126,19 @@ val event_to_yojson : event -> Yojson.Safe.t
 val activity_result_to_yojson : activity_result -> Yojson.Safe.t
 val items_to_yojson : ?group_by_tenant:bool -> item list -> Yojson.Safe.t
 val stats : item list -> stats
+val retry_delay_ms : retry_policy -> attempt:int -> int64
 
 module type BACKEND = sig
   type t
   type error
 
   val error_to_string : error -> string
+  val capabilities : t -> backend_capabilities
   val ensure : t -> (unit, error) result
   val enqueue : t -> now_ms:int64 -> workflow -> enqueue_options -> (unit, error) result
 
   val claim_next :
+    ?kind:string ->
     t ->
     worker_id:string ->
     now_ms:int64 ->
@@ -147,6 +178,15 @@ module type BACKEND = sig
     run_at_ms:int64 ->
     message:string ->
     (bool, error) result
+
+  val retry :
+    t ->
+    workflow_id:string ->
+    worker_id:string ->
+    now_ms:int64 ->
+    policy:retry_policy ->
+    message:string ->
+    (retry_decision option, error) result
 
   val snapshot : ?tenant_id:string -> t -> (item list, error) result
   val history : workflow_id:string -> t -> (event list, error) result
@@ -170,10 +210,12 @@ module type S = sig
   type error
 
   val error_to_string : error -> string
+  val capabilities : backend -> backend_capabilities
   val ensure : backend -> (unit, error) result
   val enqueue : backend -> workflow -> enqueue_options -> (unit, error) result
 
   val claim_next :
+    ?kind:string ->
     backend ->
     worker_id:string ->
     lease_ms:int64 ->
@@ -208,6 +250,14 @@ module type S = sig
     run_at_ms:int64 ->
     message:string ->
     (bool, error) result
+
+  val retry :
+    backend ->
+    workflow_id:string ->
+    worker_id:string ->
+    policy:retry_policy ->
+    message:string ->
+    (retry_decision option, error) result
 
   val snapshot : ?tenant_id:string -> backend -> (item list, error) result
   val snapshot_json : ?tenant_id:string -> ?group_by_tenant:bool -> backend -> (Yojson.Safe.t, error) result

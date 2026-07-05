@@ -159,6 +159,78 @@ let test_history_targeted_claim_and_activity_result () =
   Alcotest.(check (option string))
     "activity result preserved" (Some {|{"sha":"abc"}|}) result.result_json
 
+let test_kind_claim_filter_and_retry_policy () =
+  let now = ref 1_000L in
+  let module Runtime =
+    Workflow_runtime.Make (struct
+      let now_ms () = !now
+    end) (Workflow_runtime.Memory_backend)
+  in
+  let backend = Workflow_runtime.Memory_backend.create () in
+  let publish = workflow "publish_1" in
+  let email =
+    Workflow_runtime.{ (workflow "email_1") with kind = "send_email" }
+  in
+  Runtime.enqueue backend publish (Workflow_runtime.enqueue_options ())
+  |> expect_ok "enqueue publish";
+  Runtime.enqueue backend email (Workflow_runtime.enqueue_options ())
+  |> expect_ok "enqueue email";
+  let capabilities = Runtime.capabilities backend in
+  Alcotest.(check bool) "task queue filtering" true
+    capabilities.task_queue_filtering;
+  let claim =
+    Runtime.claim_next backend ~kind:"send_email" ~worker_id:"email-worker"
+      ~lease_ms:10_000L
+    |> expect_ok "claim kind"
+    |> Option.get
+  in
+  Alcotest.(check string) "claimed email workflow" "send_email"
+    claim.item.workflow.kind;
+  let policy =
+    Workflow_runtime.retry_policy ~max_attempts:2 ~initial_backoff_ms:250L
+      ~max_backoff_ms:1_000L ()
+  in
+  let decision =
+    Runtime.retry backend ~workflow_id:"email_1" ~worker_id:"email-worker"
+      ~policy ~message:"temporary smtp error"
+    |> expect_ok "retry"
+    |> Option.get
+  in
+  let retry_run_at =
+    match decision with
+    | Workflow_runtime.Retried { attempt; run_at_ms } ->
+        Alcotest.(check int) "retry attempt" 1 attempt;
+        run_at_ms
+    | Retries_exhausted _ -> Alcotest.fail "expected retry"
+  in
+  Alcotest.(check int64) "backoff run_at" 1_250L retry_run_at;
+  now := retry_run_at;
+  let retry_claim =
+    Runtime.claim_workflow backend ~workflow_id:"email_1"
+      ~worker_id:"email-worker" ~lease_ms:10_000L
+    |> expect_ok "claim retry"
+    |> Option.get
+  in
+  Alcotest.(check int) "second attempt" 2 retry_claim.item.attempt;
+  let final =
+    Runtime.retry backend ~workflow_id:"email_1" ~worker_id:"email-worker"
+      ~policy ~message:"smtp still down"
+    |> expect_ok "retry exhausted"
+    |> Option.get
+  in
+  (match final with
+  | Workflow_runtime.Retries_exhausted { attempt } ->
+      Alcotest.(check int) "exhausted attempt" 2 attempt
+  | Retried _ -> Alcotest.fail "expected exhausted retries");
+  let snapshot = Runtime.snapshot backend |> expect_ok "snapshot" in
+  let email_item =
+    snapshot
+    |> List.find_opt (fun item -> String.equal item.Workflow_runtime.workflow.id "email_1")
+    |> Option.get
+  in
+  Alcotest.(check string) "failed after exhausted retries" "failed"
+    (Workflow_runtime.status_to_string email_item.status)
+
 let test_grouping_filtering_and_reschedule () =
   let now = ref 10L in
   let module Runtime =
@@ -235,6 +307,8 @@ let () =
             test_multi_worker_claims_are_exclusive_and_expire;
           Alcotest.test_case "history targeted claim and activity result" `Quick
             test_history_targeted_claim_and_activity_result;
+          Alcotest.test_case "kind claim filter and retry policy" `Quick
+            test_kind_claim_filter_and_retry_policy;
           Alcotest.test_case "grouping filtering and reschedule" `Quick
             test_grouping_filtering_and_reschedule;
           Alcotest.test_case "validation" `Quick test_validation;

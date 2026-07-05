@@ -19,6 +19,8 @@ for atomic multi-instance claims.
 - Append-only ordered workflow event history for audit and replay inputs.
 - Activity result recording and lookup so retried workflow code can preserve
   completed side effects.
+- Kind-filtered claims for task-queue style workers.
+- Retry policy support with bounded exponential backoff and terminal exhaustion.
 - Tenant-filtered and tenant-grouped snapshots.
 - Core runtime has no dependency on Eio, Dream, Mongo, or application domain
   types.
@@ -30,16 +32,14 @@ Temporal is more than a distributed status table. Its reliability comes from a
 durable Event History, task queues, workflow replay, activity result
 preservation, durable timers, retries, timeouts, and worker polling. This
 library implements a smaller reusable foundation: durable state, atomic claims,
-leases, heartbeats, recovery, ordered event history, activity-result
-preservation, and visibility.
+task-queue filtering, leases, heartbeats, recovery, ordered event history,
+activity-result preservation, retry backoff, and visibility.
 
 Before calling this fully Temporal-like for complex business workflows, add:
 
 - deterministic workflow replay over event history;
-- retry policies and backoff;
 - durable timers;
 - signal/query APIs;
-- task queues separated by workflow/activity kind;
 - history compaction or continue-as-new style rollover.
 
 ## Minimal Example

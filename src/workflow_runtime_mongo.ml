@@ -25,6 +25,17 @@ let error_to_string = function
   | `Duplicate_workflow id -> "workflow already exists: " ^ id
   | `Mongo message -> "mongo: " ^ message
 
+let capabilities _ =
+  Workflow_runtime.
+    {
+      durable = true;
+      multi_worker_claims = true;
+      event_history = true;
+      activity_results = true;
+      task_queue_filtering = true;
+      retry_backoff = true;
+    }
+
 let mongo_error error = `Mongo (Mongo_error.to_string error)
 
 type metadata_doc = { key : string; value : string } [@@deriving bson]
@@ -247,6 +258,13 @@ let ensure t =
   let* () =
     Mongo_eio.direct_ensure_index t.client ~db:t.db
       ~collection:t.workflows_collection
+      (index_key [ int32 "status" 1; int32 "kind" 1; int32 "run_at_ms" 1 ])
+      [ Mongo_index.Name "workflow_kind_due_idx" ]
+    |> Result.map_error mongo_error
+  in
+  let* () =
+    Mongo_eio.direct_ensure_index t.client ~db:t.db
+      ~collection:t.workflows_collection
       (index_key [ int32 "tenant_id" 1; int32 "updated_at_ms" (-1) ])
       [ Mongo_index.Name "workflow_tenant_updated_idx" ]
     |> Result.map_error mongo_error
@@ -347,12 +365,16 @@ let find_and_modify t ~query ~update =
           let* item = item_of_workflow_doc workflow_doc in
           Ok (Some (item, Option.value workflow_doc.event_sequence ~default:0)))
 
-let claim_query ?workflow_id ~now_ms () =
+let claim_query ?workflow_id ?kind ~now_ms () =
   let id_filter =
     match workflow_id with None -> [] | Some id -> [ string "_id" id ]
   in
+  let kind_filter =
+    match kind with None -> [] | Some kind -> [ string "kind" kind ]
+  in
   doc
     (id_filter
+    @ kind_filter
     @ [
         ( "$or",
           Bson.create_list
@@ -403,8 +425,8 @@ let claim_with_query t ~query ~worker_id ~now_ms ~lease_ms =
       in
       Ok (Some { Workflow_runtime.item; worker_id; lease_expires_at_ms })
 
-let claim_next t ~worker_id ~now_ms ~lease_ms =
-  claim_with_query t ~query:(claim_query ~now_ms ()) ~worker_id ~now_ms
+let claim_next ?kind t ~worker_id ~now_ms ~lease_ms =
+  claim_with_query t ~query:(claim_query ?kind ~now_ms ()) ~worker_id ~now_ms
     ~lease_ms
 
 let claim_workflow t ~workflow_id ~worker_id ~now_ms ~lease_ms =
@@ -499,6 +521,51 @@ let reschedule t ~workflow_id ~worker_id ~now_ms ~run_at_ms ~message =
         ~kind:Workflow_runtime.Workflow_rescheduled ~worker_id ~message
         ~occurred_at_ms:now_ms ()
       |> Result.map (fun () -> true)
+
+let retry t ~workflow_id ~worker_id ~now_ms ~policy ~message =
+  let query = owned_query ~workflow_id ~worker_id in
+  let find =
+    Mongo_eio.direct_find_one t.client ~db:t.db
+      ~collection:t.workflows_collection query
+    |> Result.map_error mongo_error
+  in
+  let ( let* ) = Result.bind in
+  let* current =
+    match find with
+    | Error _ as error -> error
+    | Ok None -> Ok None
+    | Ok (Some bson) -> decode_item bson |> Result.map Option.some
+  in
+  match current with
+  | None -> Ok None
+  | Some item ->
+      if item.Workflow_runtime.attempt >= policy.Workflow_runtime.max_attempts
+      then
+        let* completed =
+          complete t ~workflow_id ~worker_id ~now_ms ~status:Workflow_runtime.Failed
+            ~message
+        in
+        if completed then
+          Ok
+            (Some
+               (Workflow_runtime.Retries_exhausted
+                  { attempt = item.Workflow_runtime.attempt }))
+        else Ok None
+      else
+        let run_at_ms =
+          Int64.add now_ms
+            (Workflow_runtime.retry_delay_ms policy
+               ~attempt:item.Workflow_runtime.attempt)
+        in
+        let* rescheduled =
+          reschedule t ~workflow_id ~worker_id ~now_ms ~run_at_ms ~message
+        in
+        if rescheduled then
+          Ok
+            (Some
+               (Workflow_runtime.Retried
+                  { attempt = item.Workflow_runtime.attempt; run_at_ms }))
+        else Ok None
 
 let snapshot ?tenant_id t =
   let filter =
