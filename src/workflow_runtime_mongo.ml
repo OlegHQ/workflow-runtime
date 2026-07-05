@@ -1,6 +1,8 @@
 type error =
   [ `Bad_document of string
   | `Duplicate_workflow of string
+  | `Invalid_transition of string
+  | `Invalid_workflow of string
   | `Mongo of string ]
 
 type t = {
@@ -31,6 +33,8 @@ let create ~client ~db ~collection () =
 let error_to_string = function
   | `Bad_document message -> "bad document: " ^ message
   | `Duplicate_workflow id -> "workflow already exists: " ^ id
+  | `Invalid_transition message -> message
+  | `Invalid_workflow message -> message
   | `Mongo message -> "mongo: " ^ message
 
 let capabilities _ =
@@ -624,6 +628,11 @@ let cancel_payload ~reason =
   |> Yojson.Safe.to_string
 
 let enqueue t ~now_ms workflow (options : Workflow_runtime.enqueue_options) =
+  let ( let* ) = Result.bind in
+  let* () =
+    Workflow_runtime.validate_workflow workflow
+    |> Result.map_error (fun message -> `Invalid_workflow message)
+  in
   let item =
     Workflow_runtime.
       {
@@ -642,7 +651,6 @@ let enqueue t ~now_ms workflow (options : Workflow_runtime.enqueue_options) =
       }
   in
   let workflow_doc = { (workflow_doc_of_item item) with event_sequence = Some 1 } in
-  let ( let* ) = Result.bind in
   let* () =
     Mongo_eio.direct_insert_one t.client ~db:t.db
       ~collection:t.workflows_collection
@@ -857,6 +865,11 @@ let fire_due_timers t ~workflow_id ~now_ms ~first_sequence =
   loop_repairs next_sequence false fired_timers
 
 let claim_with_query t ~query ~worker_id ~now_ms ~lease_ms =
+  let ( let* ) = Result.bind in
+  let* () =
+    Workflow_runtime.validate_claim_args ~worker_id ~lease_ms
+    |> Result.map_error (fun message -> `Invalid_transition message)
+  in
   let lease_expires_at_ms = Int64.add now_ms lease_ms in
   let update =
     doc
@@ -878,7 +891,6 @@ let claim_with_query t ~query ~worker_id ~now_ms ~lease_ms =
   | Ok None -> Ok None
   | Ok (Some (item, sequence)) ->
       let workflow_id = item.Workflow_runtime.workflow.id in
-      let ( let* ) = Result.bind in
       let* sequence =
         fire_due_timers t ~workflow_id ~now_ms ~first_sequence:sequence
       in
@@ -913,6 +925,11 @@ let update_owned t ~workflow_id ~worker_id ~now_ms update =
   |> Result.map (Option.map snd)
 
 let heartbeat t ~workflow_id ~worker_id ~now_ms ~lease_ms =
+  let ( let* ) = Result.bind in
+  let* () =
+    Workflow_runtime.validate_claim_args ~worker_id ~lease_ms
+    |> Result.map_error (fun message -> `Invalid_transition message)
+  in
   let update =
     doc
       [
@@ -1003,13 +1020,21 @@ let reschedule t ~workflow_id ~worker_id ~now_ms ~run_at_ms ~message =
       |> Result.map (fun () -> true)
 
 let retry t ~workflow_id ~worker_id ~now_ms ~policy ~message =
+  let ( let* ) = Result.bind in
+  let* () =
+    Workflow_runtime.validate_worker_id worker_id
+    |> Result.map_error (fun message -> `Invalid_transition message)
+  in
+  let* () =
+    Workflow_runtime.validate_retry_policy policy
+    |> Result.map_error (fun message -> `Invalid_transition message)
+  in
   let query = active_owned_query ~workflow_id ~worker_id ~now_ms in
   let find =
     Mongo_eio.direct_find_one t.client ~db:t.db
       ~collection:t.workflows_collection query
     |> Result.map_error mongo_error
   in
-  let ( let* ) = Result.bind in
   let* current =
     match find with
     | Error _ as error -> error

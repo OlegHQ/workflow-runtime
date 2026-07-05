@@ -674,24 +674,83 @@ let test_validation () =
     end) (Workflow_runtime.Memory_backend)
   in
   let backend = Workflow_runtime.Memory_backend.create () in
-  match
-    Runtime.enqueue backend
-      Workflow_runtime.
-        {
-          id = "";
-          tenant_id = "tenant";
-          kind = "kind";
-          subject_id = None;
-          name = None;
-          metadata = [];
-        }
-      (Workflow_runtime.enqueue_options ())
-  with
+  Alcotest.check_raises "bad max attempts"
+    (Invalid_argument "retry max_attempts must be positive")
+    (fun () ->
+      ignore (Workflow_runtime.retry_policy ~max_attempts:0 ()));
+  Alcotest.check_raises "bad initial backoff"
+    (Invalid_argument "retry initial_backoff_ms must be zero or positive")
+    (fun () ->
+      ignore (Workflow_runtime.retry_policy ~initial_backoff_ms:(-1L) ()));
+  Alcotest.check_raises "bad max backoff"
+    (Invalid_argument "retry max_backoff_ms must be zero or positive")
+    (fun () ->
+      ignore (Workflow_runtime.retry_policy ~max_backoff_ms:(-1L) ()));
+  Alcotest.check_raises "bad backoff order"
+    (Invalid_argument "retry initial_backoff_ms must not exceed max_backoff_ms")
+    (fun () ->
+      ignore
+        (Workflow_runtime.retry_policy ~initial_backoff_ms:2L
+           ~max_backoff_ms:1L ()));
+  Alcotest.check_raises "bad multiplier"
+    (Invalid_argument "retry backoff_multiplier must be finite and at least 1.0")
+    (fun () ->
+      ignore (Workflow_runtime.retry_policy ~backoff_multiplier:0.5 ()));
+  (match
+     Runtime.enqueue backend
+       Workflow_runtime.
+         {
+           id = "";
+           tenant_id = "tenant";
+           kind = "kind";
+           subject_id = None;
+           name = None;
+           metadata = [];
+         }
+       (Workflow_runtime.enqueue_options ())
+   with
   | Error (`Invalid_workflow _) -> ()
   | Ok () -> Alcotest.fail "expected validation error"
   | Error error ->
       Alcotest.fail
-        ("unexpected error: " ^ Workflow_runtime.Memory_backend.error_to_string error)
+        ("unexpected error: " ^ Workflow_runtime.Memory_backend.error_to_string error));
+  Runtime.enqueue backend (workflow "valid_wf") (Workflow_runtime.enqueue_options ())
+  |> expect_ok "enqueue valid";
+  (match Runtime.claim_next backend ~worker_id:"" ~lease_ms:100L with
+  | Error (`Invalid_transition message) ->
+      Alcotest.(check string) "empty worker id" "worker_id must not be empty"
+        message
+  | Ok _ -> Alcotest.fail "expected empty worker id error"
+  | Error error ->
+      Alcotest.fail
+        ("unexpected error: " ^ Workflow_runtime.Memory_backend.error_to_string error));
+  (match Runtime.claim_workflow backend ~workflow_id:"valid_wf"
+           ~worker_id:"worker_a" ~lease_ms:0L with
+  | Error (`Invalid_transition message) ->
+      Alcotest.(check string) "bad lease" "lease_ms must be positive" message
+  | Ok _ -> Alcotest.fail "expected lease validation error"
+  | Error error ->
+      Alcotest.fail
+        ("unexpected error: " ^ Workflow_runtime.Memory_backend.error_to_string error));
+  let invalid_policy : Workflow_runtime.retry_policy =
+    {
+      max_attempts = 0;
+      initial_backoff_ms = 0L;
+      max_backoff_ms = 0L;
+      backoff_multiplier = 1.0;
+    }
+  in
+  (match
+     Runtime.retry backend ~workflow_id:"valid_wf" ~worker_id:"worker_a"
+       ~policy:invalid_policy ~message:"bad policy"
+   with
+  | Error (`Invalid_transition message) ->
+      Alcotest.(check string)
+        "bad retry policy" "retry max_attempts must be positive" message
+  | Ok _ -> Alcotest.fail "expected retry policy validation error"
+  | Error error ->
+      Alcotest.fail
+        ("unexpected error: " ^ Workflow_runtime.Memory_backend.error_to_string error))
 
 let test_owned_operations_require_active_lease () =
   let now = ref 10_000L in

@@ -208,6 +208,18 @@ val retry_policy :
   ?backoff_multiplier:float ->
   unit ->
   retry_policy
+(** [retry_policy ()] builds a retry policy.
+
+    [max_attempts] must be positive, backoff durations must be zero or
+    positive, [initial_backoff_ms] must not exceed [max_backoff_ms], and
+    [backoff_multiplier] must be finite and at least [1.0]. Raises
+    [Invalid_argument] for invalid values. *)
+
+val validate_workflow : workflow -> (unit, string) result
+val validate_worker_id : string -> (unit, string) result
+val validate_lease_ms : int64 -> (unit, string) result
+val validate_claim_args : worker_id:string -> lease_ms:int64 -> (unit, string) result
+val validate_retry_policy : retry_policy -> (unit, string) result
 
 val status_to_string : status -> string
 val status_of_string : string -> (status, string) result

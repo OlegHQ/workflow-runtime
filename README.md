@@ -59,6 +59,8 @@ reusable Eio worker runner over the same functorized runtime API.
   retry, and handler-failure recording.
 - Worker-runner configuration validates lease and heartbeat timings, and
   heartbeat loss stops the handler fiber before stale work can complete.
+- Core and Mongo backends reject invalid workflows, worker ids, lease durations,
+  and retry policies before mutating durable state.
 - Tenant-filtered and tenant-grouped snapshots.
 - Core runtime has no dependency on Eio, Dream, Mongo, or application domain
   types.

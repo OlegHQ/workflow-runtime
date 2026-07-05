@@ -28,6 +28,19 @@ let expect_ok label = function
   | Error error ->
       Alcotest.fail (label ^ ": " ^ Workflow_runtime_mongo.error_to_string error)
 
+let expect_invalid_workflow label expected = function
+  | Error (`Invalid_workflow message) -> Alcotest.(check string) label expected message
+  | Ok _ -> Alcotest.fail (label ^ ": expected invalid workflow")
+  | Error error ->
+      Alcotest.fail (label ^ ": " ^ Workflow_runtime_mongo.error_to_string error)
+
+let expect_invalid_transition label expected = function
+  | Error (`Invalid_transition message) ->
+      Alcotest.(check string) label expected message
+  | Ok _ -> Alcotest.fail (label ^ ": expected invalid transition")
+  | Error error ->
+      Alcotest.fail (label ^ ": " ^ Workflow_runtime_mongo.error_to_string error)
+
 let bson_doc fields =
   List.fold_right (fun (name, element) acc -> Bson.add_element name element acc)
     fields Bson.empty
@@ -50,6 +63,78 @@ let index_names client ~db ~collection =
   |> fun (response : Mongo_command.response) ->
   cursor_batch "firstBatch" response.body
   |> List.map (fun index -> Bson.get_string (Bson.get_element "name" index))
+
+let test_mongo_validation () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let config =
+    Mongo_config.
+      {
+        (default ~host ~port ~database:db ()) with
+        direct_connection = true;
+        server_selection_timeout_ms = 2_000;
+        connect_timeout_ms = 2_000;
+        socket_timeout_ms = Some 5_000;
+        app_name = Some "workflow-runtime-e2e";
+      }
+  in
+  let client =
+    match
+      Mongo_eio.connect ~sw ~net:(Eio.Stdenv.net env)
+        ~clock:(Eio.Stdenv.clock env) ~config
+    with
+    | Ok client -> client
+    | Error error ->
+        Alcotest.fail ("connect: " ^ Mongo_error.to_string error)
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      let _ =
+        Mongo_eio.direct_run_command client db
+          [ ("dropDatabase", Bson.create_int32 1l) ]
+      in
+      Mongo_eio.close_direct client)
+    (fun () ->
+      let backend =
+        Workflow_runtime_mongo.create ~client ~db ~collection:"validation_workflows" ()
+      in
+      Workflow_runtime_mongo.ensure backend |> expect_ok "ensure";
+      Workflow_runtime_mongo.enqueue backend ~now_ms:1L
+        Workflow_runtime.
+          {
+            id = "";
+            tenant_id = "tenant";
+            kind = "kind";
+            subject_id = None;
+            name = None;
+            metadata = [];
+          }
+        (Workflow_runtime.enqueue_options ())
+      |> expect_invalid_workflow "invalid workflow"
+           "workflow id must not be empty";
+      Workflow_runtime_mongo.enqueue backend ~now_ms:1L (workflow "valid_wf")
+        (Workflow_runtime.enqueue_options ())
+      |> expect_ok "enqueue valid";
+      Workflow_runtime_mongo.claim_next backend ~worker_id:"" ~now_ms:1L
+        ~lease_ms:100L
+      |> expect_invalid_transition "empty worker id"
+           "worker_id must not be empty";
+      Workflow_runtime_mongo.claim_workflow backend ~workflow_id:"valid_wf"
+        ~worker_id:"worker_a" ~now_ms:1L ~lease_ms:0L
+      |> expect_invalid_transition "bad lease" "lease_ms must be positive";
+      let invalid_policy : Workflow_runtime.retry_policy =
+        {
+          max_attempts = 0;
+          initial_backoff_ms = 0L;
+          max_backoff_ms = 0L;
+          backoff_multiplier = 1.0;
+        }
+      in
+      Workflow_runtime_mongo.retry backend ~workflow_id:"valid_wf"
+        ~worker_id:"worker_a" ~now_ms:1L ~policy:invalid_policy
+        ~message:"bad policy"
+      |> expect_invalid_transition "bad retry policy"
+           "retry max_attempts must be positive")
 
 let test_mongo_claims_and_lease_recovery () =
   Eio_main.run @@ fun env ->
@@ -1260,6 +1345,7 @@ let () =
     [
       ( "mongo",
         [
+          Alcotest.test_case "validation" `Quick test_mongo_validation;
           Alcotest.test_case "claims and lease recovery" `Quick
             test_mongo_claims_and_lease_recovery;
           Alcotest.test_case "owned operations require active lease" `Quick

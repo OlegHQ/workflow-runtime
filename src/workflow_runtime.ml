@@ -194,9 +194,33 @@ type replay_state = {
 let enqueue_options ?(run_at_ms = 0L) ?payload_json () =
   { run_at_ms; payload_json }
 
+let finite_float value =
+  match classify_float value with
+  | FP_nan | FP_infinite -> false
+  | FP_normal | FP_subnormal | FP_zero -> true
+
+let validate_retry_policy (policy : retry_policy) =
+  if policy.max_attempts < 1 then Error "retry max_attempts must be positive"
+  else if policy.initial_backoff_ms < 0L then
+    Error "retry initial_backoff_ms must be zero or positive"
+  else if policy.max_backoff_ms < 0L then
+    Error "retry max_backoff_ms must be zero or positive"
+  else if policy.initial_backoff_ms > policy.max_backoff_ms then
+    Error "retry initial_backoff_ms must not exceed max_backoff_ms"
+  else if
+    (not (finite_float policy.backoff_multiplier))
+    || policy.backoff_multiplier < 1.0
+  then Error "retry backoff_multiplier must be finite and at least 1.0"
+  else Ok ()
+
 let retry_policy ?(max_attempts = 3) ?(initial_backoff_ms = 1_000L)
     ?(max_backoff_ms = 300_000L) ?(backoff_multiplier = 2.0) () =
-  { max_attempts; initial_backoff_ms; max_backoff_ms; backoff_multiplier }
+  let policy =
+    { max_attempts; initial_backoff_ms; max_backoff_ms; backoff_multiplier }
+  in
+  match validate_retry_policy policy with
+  | Ok () -> policy
+  | Error message -> invalid_arg message
 
 let retry_delay_ms policy ~attempt =
   let exponent = max 0 (attempt - 1) in
@@ -291,6 +315,17 @@ let validate_workflow (workflow : workflow) =
     Error "workflow tenant_id must not be empty"
   else if String.equal workflow.kind "" then Error "workflow kind must not be empty"
   else Ok ()
+
+let validate_worker_id worker_id =
+  if String.equal worker_id "" then Error "worker_id must not be empty" else Ok ()
+
+let validate_lease_ms lease_ms =
+  if lease_ms <= 0L then Error "lease_ms must be positive" else Ok ()
+
+let validate_claim_args ~worker_id ~lease_ms =
+  let ( let* ) = Result.bind in
+  let* () = validate_worker_id worker_id in
+  validate_lease_ms lease_ms
 
 let newest_first (items : item list) =
   List.sort
@@ -1501,6 +1536,11 @@ module Memory_backend = struct
              ~occurred_at_ms:now_ms t)
 
   let claim_next ?kind t ~worker_id ~now_ms ~lease_ms =
+    let ( let* ) = Result.bind in
+    let* () =
+      validate_claim_args ~worker_id ~lease_ms
+      |> Result.map_error (fun message -> `Invalid_transition message)
+    in
     with_lock t (fun () ->
         let candidate =
           t.records |> Hashtbl.to_seq_values |> List.of_seq
@@ -1536,6 +1576,11 @@ module Memory_backend = struct
             Ok (Some { item = claimed; worker_id; lease_expires_at_ms }))
 
   let claim_workflow t ~workflow_id ~worker_id ~now_ms ~lease_ms =
+    let ( let* ) = Result.bind in
+    let* () =
+      validate_claim_args ~worker_id ~lease_ms
+      |> Result.map_error (fun message -> `Invalid_transition message)
+    in
     with_lock t (fun () ->
         match Hashtbl.find_opt t.records workflow_id with
         | Some record when claimable ~now_ms record.item ->
@@ -1602,6 +1647,11 @@ module Memory_backend = struct
         | _ -> Ok false)
 
   let heartbeat t ~workflow_id ~worker_id ~now_ms ~lease_ms =
+    let ( let* ) = Result.bind in
+    let* () =
+      validate_claim_args ~worker_id ~lease_ms
+      |> Result.map_error (fun message -> `Invalid_transition message)
+    in
     with_lock t (fun () ->
         match Hashtbl.find_opt t.records workflow_id with
         | Some record when active_owned_by ~now_ms record.item worker_id ->
@@ -1669,6 +1719,15 @@ module Memory_backend = struct
         | _ -> Ok false)
 
   let retry t ~workflow_id ~worker_id ~now_ms ~policy ~message =
+    let ( let* ) = Result.bind in
+    let* () =
+      validate_worker_id worker_id
+      |> Result.map_error (fun message -> `Invalid_transition message)
+    in
+    let* () =
+      validate_retry_policy policy
+      |> Result.map_error (fun message -> `Invalid_transition message)
+    in
     with_lock t (fun () ->
         match Hashtbl.find_opt t.records workflow_id with
         | Some record when active_owned_by ~now_ms record.item worker_id ->

@@ -1,6 +1,8 @@
 type error =
   [ `Bad_document of string
   | `Duplicate_workflow of string
+  | `Invalid_transition of string
+  | `Invalid_workflow of string
   | `Mongo of string ]
 
 type t
