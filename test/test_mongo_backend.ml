@@ -80,7 +80,8 @@ let test_mongo_claims_and_lease_recovery () =
       in
       Alcotest.(check bool) "not double claimed" true (Option.is_none second);
       let recovered =
-        Workflow_runtime_mongo.claim_next backend_b ~worker_id:"worker_b"
+        Workflow_runtime_mongo.claim_workflow backend_b ~workflow_id:"wf_1"
+          ~worker_id:"worker_b"
           ~now_ms:1_101L ~lease_ms:100L
         |> expect_ok "claim expired"
         |> Option.get
@@ -97,7 +98,106 @@ let test_mongo_claims_and_lease_recovery () =
       Alcotest.(check int) "one workflow" 1 (List.length snapshot);
       Alcotest.(check string)
         "succeeded" "succeeded"
-        (Workflow_runtime.status_to_string (List.hd snapshot).status))
+        (Workflow_runtime.status_to_string (List.hd snapshot).status);
+      let history =
+        Workflow_runtime_mongo.history ~workflow_id:"wf_1" backend_a
+        |> expect_ok "history"
+      in
+      Alcotest.(check (list string))
+        "history"
+        [
+          "workflow_enqueued";
+          "workflow_claimed";
+          "workflow_claimed";
+          "workflow_completed";
+        ]
+        (List.map
+           (fun event ->
+             Workflow_runtime.event_kind_to_string event.Workflow_runtime.kind)
+           history);
+      Alcotest.(check (list int))
+        "sequence"
+        [ 1; 2; 3; 4 ]
+        (List.map (fun event -> event.Workflow_runtime.sequence) history))
+
+let test_mongo_activity_results_survive_backend_instances () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let config =
+    Mongo_config.
+      {
+        (default ~host ~port ~database:db ()) with
+        direct_connection = true;
+        server_selection_timeout_ms = 2_000;
+        connect_timeout_ms = 2_000;
+        socket_timeout_ms = Some 5_000;
+        app_name = Some "workflow-runtime-e2e";
+      }
+  in
+  let client =
+    match
+      Mongo_eio.connect ~sw ~net:(Eio.Stdenv.net env)
+        ~clock:(Eio.Stdenv.clock env) ~config
+    with
+    | Ok client -> client
+    | Error error ->
+        Alcotest.fail ("connect: " ^ Mongo_error.to_string error)
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      let _ =
+        Mongo_eio.direct_run_command client db
+          [ ("dropDatabase", Bson.create_int32 1l) ]
+      in
+      Mongo_eio.close_direct client)
+    (fun () ->
+      let backend_a =
+        Workflow_runtime_mongo.create ~client ~db ~collection:"activity_workflows" ()
+      in
+      let backend_b =
+        Workflow_runtime_mongo.create ~client ~db ~collection:"activity_workflows" ()
+      in
+      Workflow_runtime_mongo.ensure backend_a |> expect_ok "ensure";
+      Workflow_runtime_mongo.enqueue backend_a ~now_ms:2_000L (workflow "wf_activity")
+        (Workflow_runtime.enqueue_options ~run_at_ms:2_000L ())
+      |> expect_ok "enqueue";
+      let claim =
+        Workflow_runtime_mongo.claim_workflow backend_a ~workflow_id:"wf_activity"
+          ~worker_id:"worker_a" ~now_ms:2_001L ~lease_ms:1_000L
+        |> expect_ok "claim"
+        |> Option.get
+      in
+      Alcotest.(check string) "claimed" "wf_activity" claim.item.workflow.id;
+      Workflow_runtime_mongo.record_activity_result backend_a ~now_ms:2_002L
+        Workflow_runtime.
+          {
+            activity_id = "publish_call";
+            workflow_id = "wf_activity";
+            name = "Publish call";
+            attempt = 1;
+            status = Activity_succeeded;
+            result_json = Some {|{"external_id":"123"}|};
+            error = None;
+            updated_at_ms = 0L;
+          }
+      |> expect_ok "record activity";
+      let found =
+        Workflow_runtime_mongo.find_activity_result backend_b
+          ~workflow_id:"wf_activity" ~activity_id:"publish_call"
+        |> expect_ok "find activity"
+        |> Option.get
+      in
+      Alcotest.(check (option string))
+        "result survives backend instance" (Some {|{"external_id":"123"}|})
+        found.result_json;
+      let history =
+        Workflow_runtime_mongo.history ~workflow_id:"wf_activity" backend_b
+        |> expect_ok "history"
+      in
+      Alcotest.(check string)
+        "activity event" "activity_completed"
+        (history |> List.rev |> List.hd |> fun event ->
+         Workflow_runtime.event_kind_to_string event.Workflow_runtime.kind))
 
 let () =
   Mirage_crypto_rng_unix.use_default ();
@@ -107,5 +207,7 @@ let () =
         [
           Alcotest.test_case "claims and lease recovery" `Quick
             test_mongo_claims_and_lease_recovery;
+          Alcotest.test_case "activity results survive backend instances" `Quick
+            test_mongo_activity_results_survive_backend_instances;
         ] );
     ]

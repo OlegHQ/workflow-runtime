@@ -40,6 +40,43 @@ type stats = {
   failed : int;
 }
 
+type event_kind =
+  | Workflow_enqueued
+  | Workflow_claimed
+  | Workflow_heartbeat
+  | Workflow_completed
+  | Workflow_rescheduled
+  | Activity_scheduled
+  | Activity_started
+  | Activity_completed
+  | Activity_failed
+  | Timer_scheduled
+  | Timer_fired
+
+type event = {
+  id : string;
+  workflow_id : string;
+  sequence : int;
+  kind : event_kind;
+  worker_id : string option;
+  payload_json : string option;
+  message : string option;
+  occurred_at_ms : int64;
+}
+
+type activity_status = Activity_succeeded | Activity_failed
+
+type activity_result = {
+  activity_id : string;
+  workflow_id : string;
+  name : string;
+  attempt : int;
+  status : activity_status;
+  result_json : string option;
+  error : string option;
+  updated_at_ms : int64;
+}
+
 let enqueue_options ?(run_at_ms = 0L) ?payload_json () =
   { run_at_ms; payload_json }
 
@@ -58,15 +95,54 @@ let status_of_string = function
   | "failed" -> Ok Failed
   | value -> Error ("unknown workflow status: " ^ value)
 
-let validate_workflow workflow =
+let event_kind_to_string = function
+  | Workflow_enqueued -> "workflow_enqueued"
+  | Workflow_claimed -> "workflow_claimed"
+  | Workflow_heartbeat -> "workflow_heartbeat"
+  | Workflow_completed -> "workflow_completed"
+  | Workflow_rescheduled -> "workflow_rescheduled"
+  | Activity_scheduled -> "activity_scheduled"
+  | Activity_started -> "activity_started"
+  | Activity_completed -> "activity_completed"
+  | Activity_failed -> "activity_failed"
+  | Timer_scheduled -> "timer_scheduled"
+  | Timer_fired -> "timer_fired"
+
+let event_kind_of_string = function
+  | "workflow_enqueued" -> Ok Workflow_enqueued
+  | "workflow_claimed" -> Ok Workflow_claimed
+  | "workflow_heartbeat" -> Ok Workflow_heartbeat
+  | "workflow_completed" -> Ok Workflow_completed
+  | "workflow_rescheduled" -> Ok Workflow_rescheduled
+  | "activity_scheduled" -> Ok Activity_scheduled
+  | "activity_started" -> Ok Activity_started
+  | "activity_completed" -> Ok Activity_completed
+  | "activity_failed" -> Ok Activity_failed
+  | "timer_scheduled" -> Ok Timer_scheduled
+  | "timer_fired" -> Ok Timer_fired
+  | value -> Error ("unknown workflow event kind: " ^ value)
+
+let activity_status_to_string = function
+  | Activity_succeeded -> "succeeded"
+  | Activity_failed -> "failed"
+
+let activity_status_of_string = function
+  | "succeeded" -> Ok Activity_succeeded
+  | "failed" -> Ok Activity_failed
+  | value -> Error ("unknown activity status: " ^ value)
+
+let validate_workflow (workflow : workflow) =
   if String.equal workflow.id "" then Error "workflow id must not be empty"
   else if String.equal workflow.tenant_id "" then
     Error "workflow tenant_id must not be empty"
   else if String.equal workflow.kind "" then Error "workflow kind must not be empty"
   else Ok ()
 
-let newest_first items =
-  List.sort (fun a b -> Int64.compare b.updated_at_ms a.updated_at_ms) items
+let newest_first (items : item list) =
+  List.sort
+    (fun (a : item) (b : item) ->
+      Int64.compare b.updated_at_ms a.updated_at_ms)
+    items
 
 let int64_json value = `Intlit (Int64.to_string value)
 let option_json f = function Some value -> f value | None -> `Null
@@ -96,12 +172,38 @@ let item_to_yojson item =
       ("updated_at_ms", int64_json item.updated_at_ms);
     ]
 
+let event_to_yojson event =
+  `Assoc
+    [
+      ("id", `String event.id);
+      ("workflow_id", `String event.workflow_id);
+      ("sequence", `Int event.sequence);
+      ("kind", `String (event_kind_to_string event.kind));
+      ("worker_id", option_json (fun value -> `String value) event.worker_id);
+      ("payload_json", option_json (fun value -> `String value) event.payload_json);
+      ("message", option_json (fun value -> `String value) event.message);
+      ("occurred_at_ms", int64_json event.occurred_at_ms);
+    ]
+
+let activity_result_to_yojson result =
+  `Assoc
+    [
+      ("activity_id", `String result.activity_id);
+      ("workflow_id", `String result.workflow_id);
+      ("name", `String result.name);
+      ("attempt", `Int result.attempt);
+      ("status", `String (activity_status_to_string result.status));
+      ("result_json", option_json (fun value -> `String value) result.result_json);
+      ("error", option_json (fun value -> `String value) result.error);
+      ("updated_at_ms", int64_json result.updated_at_ms);
+    ]
+
 let empty_stats =
   { total = 0; queued = 0; running = 0; succeeded = 0; blocked = 0; failed = 0 }
 
-let stats items =
+let stats (items : item list) =
   List.fold_left
-    (fun stats item ->
+    (fun stats (item : item) ->
       match item.status with
       | Queued -> { stats with total = stats.total + 1; queued = stats.queued + 1 }
       | Running ->
@@ -124,7 +226,7 @@ let stats_json stats =
       ("failed", `Int stats.failed);
     ]
 
-let items_to_yojson ?(group_by_tenant = false) items =
+let items_to_yojson ?(group_by_tenant = false) (items : item list) =
   let items = newest_first items in
   if group_by_tenant then
     let groups =
@@ -168,6 +270,14 @@ module type BACKEND = sig
     lease_ms:int64 ->
     (claim option, error) result
 
+  val claim_workflow :
+    t ->
+    workflow_id:string ->
+    worker_id:string ->
+    now_ms:int64 ->
+    lease_ms:int64 ->
+    (claim option, error) result
+
   val heartbeat :
     t ->
     workflow_id:string ->
@@ -195,6 +305,16 @@ module type BACKEND = sig
     (bool, error) result
 
   val snapshot : ?tenant_id:string -> t -> (item list, error) result
+  val history : workflow_id:string -> t -> (event list, error) result
+
+  val record_activity_result :
+    t -> now_ms:int64 -> activity_result -> (unit, error) result
+
+  val find_activity_result :
+    t ->
+    workflow_id:string ->
+    activity_id:string ->
+    (activity_result option, error) result
 end
 
 module type CLOCK = sig
@@ -211,6 +331,13 @@ module type S = sig
 
   val claim_next :
     backend ->
+    worker_id:string ->
+    lease_ms:int64 ->
+    (claim option, error) result
+
+  val claim_workflow :
+    backend ->
+    workflow_id:string ->
     worker_id:string ->
     lease_ms:int64 ->
     (claim option, error) result
@@ -240,6 +367,16 @@ module type S = sig
 
   val snapshot : ?tenant_id:string -> backend -> (item list, error) result
   val snapshot_json : ?tenant_id:string -> ?group_by_tenant:bool -> backend -> (Yojson.Safe.t, error) result
+  val history : workflow_id:string -> backend -> (event list, error) result
+
+  val record_activity_result :
+    backend -> activity_result -> (unit, error) result
+
+  val find_activity_result :
+    backend ->
+    workflow_id:string ->
+    activity_id:string ->
+    (activity_result option, error) result
 end
 
 module Make (Clock : CLOCK) (Backend : BACKEND) = struct
@@ -250,10 +387,15 @@ module Make (Clock : CLOCK) (Backend : BACKEND) = struct
   let ensure = Backend.ensure
   let enqueue backend workflow options = Backend.enqueue backend ~now_ms:(Clock.now_ms ()) workflow options
   let claim_next backend ~worker_id ~lease_ms = Backend.claim_next backend ~worker_id ~now_ms:(Clock.now_ms ()) ~lease_ms
+  let claim_workflow backend ~workflow_id ~worker_id ~lease_ms = Backend.claim_workflow backend ~workflow_id ~worker_id ~now_ms:(Clock.now_ms ()) ~lease_ms
   let heartbeat backend ~workflow_id ~worker_id ~lease_ms = Backend.heartbeat backend ~workflow_id ~worker_id ~now_ms:(Clock.now_ms ()) ~lease_ms
   let complete backend ~workflow_id ~worker_id ~status ~message = Backend.complete backend ~workflow_id ~worker_id ~now_ms:(Clock.now_ms ()) ~status ~message
   let reschedule backend ~workflow_id ~worker_id ~run_at_ms ~message = Backend.reschedule backend ~workflow_id ~worker_id ~now_ms:(Clock.now_ms ()) ~run_at_ms ~message
   let snapshot = Backend.snapshot
+  let history = Backend.history
+  let record_activity_result backend result =
+    Backend.record_activity_result backend ~now_ms:(Clock.now_ms ()) result
+  let find_activity_result = Backend.find_activity_result
 
   let snapshot_json ?tenant_id ?(group_by_tenant = false) backend =
     Backend.snapshot ?tenant_id backend
@@ -266,9 +408,22 @@ module Memory_backend = struct
     | `Invalid_workflow of string
     | `Invalid_transition of string ]
 
-  type t = { mutex : Mutex.t; records : (string, item) Hashtbl.t }
+  type record = { mutable item : item; mutable event_sequence : int }
 
-  let create () = { mutex = Mutex.create (); records = Hashtbl.create 128 }
+  type t = {
+    mutex : Mutex.t;
+    records : (string, record) Hashtbl.t;
+    events : (string, event list) Hashtbl.t;
+    activity_results : (string, activity_result) Hashtbl.t;
+  }
+
+  let create () =
+    {
+      mutex = Mutex.create ();
+      records = Hashtbl.create 128;
+      events = Hashtbl.create 128;
+      activity_results = Hashtbl.create 128;
+    }
 
   let error_to_string = function
     | `Duplicate_workflow id -> "workflow already exists: " ^ id
@@ -280,6 +435,27 @@ module Memory_backend = struct
     Fun.protect f ~finally:(fun () -> Mutex.unlock t.mutex)
 
   let ensure _ = Ok ()
+
+  let activity_key ~workflow_id ~activity_id = workflow_id ^ "\000" ^ activity_id
+
+  let append_event record ~workflow_id ~kind ?worker_id ?payload_json ?message
+      ~occurred_at_ms t =
+    let sequence = record.event_sequence + 1 in
+    record.event_sequence <- sequence;
+    let event =
+      {
+        id = workflow_id ^ ":" ^ string_of_int sequence;
+        workflow_id;
+        sequence;
+        kind;
+        worker_id;
+        payload_json;
+        message;
+        occurred_at_ms;
+      }
+    in
+    let existing = Option.value (Hashtbl.find_opt t.events workflow_id) ~default:[] in
+    Hashtbl.replace t.events workflow_id (event :: existing)
 
   let enqueue t ~now_ms workflow options =
     match validate_workflow workflow with
@@ -305,7 +481,10 @@ module Memory_backend = struct
                   updated_at_ms = now_ms;
                 }
               in
-              Hashtbl.add t.records workflow.id item;
+              let record = { item; event_sequence = 0 } in
+              Hashtbl.add t.records workflow.id record;
+              append_event record ~workflow_id:workflow.id ~kind:Workflow_enqueued
+                ?payload_json:options.payload_json ~occurred_at_ms:now_ms t;
               Ok ())
 
   let lease_available ~now_ms (item : item) =
@@ -324,17 +503,17 @@ module Memory_backend = struct
     with_lock t (fun () ->
         let candidate =
           t.records |> Hashtbl.to_seq_values |> List.of_seq
-          |> fun (items : item list) -> items
-          |> List.filter (claimable ~now_ms)
-          |> List.sort (fun (a : item) (b : item) ->
-                 let by_run = Int64.compare a.run_at_ms b.run_at_ms in
+          |> List.filter (fun record -> claimable ~now_ms record.item)
+          |> List.sort (fun a b ->
+                 let by_run = Int64.compare a.item.run_at_ms b.item.run_at_ms in
                  if by_run <> 0 then by_run
-                 else String.compare a.workflow.id b.workflow.id)
+                 else String.compare a.item.workflow.id b.item.workflow.id)
           |> List.find_opt (fun _ -> true)
         in
         match candidate with
         | None -> Ok None
-        | Some item ->
+        | Some record ->
+            let item = record.item in
             let lease_expires_at_ms = Int64.add now_ms lease_ms in
             let claimed =
               {
@@ -348,8 +527,34 @@ module Memory_backend = struct
                 updated_at_ms = now_ms;
               }
             in
-            Hashtbl.replace t.records item.workflow.id claimed;
+            record.item <- claimed;
+            append_event record ~workflow_id:item.workflow.id ~kind:Workflow_claimed
+              ~worker_id ~occurred_at_ms:now_ms t;
             Ok (Some { item = claimed; worker_id; lease_expires_at_ms }))
+
+  let claim_workflow t ~workflow_id ~worker_id ~now_ms ~lease_ms =
+    with_lock t (fun () ->
+        match Hashtbl.find_opt t.records workflow_id with
+        | Some record when claimable ~now_ms record.item ->
+            let item = record.item in
+            let lease_expires_at_ms = Int64.add now_ms lease_ms in
+            let claimed =
+              {
+                item with
+                status = Running;
+                attempt = item.attempt + 1;
+                lease_owner = Some worker_id;
+                lease_expires_at_ms = Some lease_expires_at_ms;
+                started_at_ms = Some (Option.value item.started_at_ms ~default:now_ms);
+                finished_at_ms = None;
+                updated_at_ms = now_ms;
+              }
+            in
+            record.item <- claimed;
+            append_event record ~workflow_id ~kind:Workflow_claimed ~worker_id
+              ~occurred_at_ms:now_ms t;
+            Ok (Some { item = claimed; worker_id; lease_expires_at_ms })
+        | _ -> Ok None)
 
   let owned_by item worker_id =
     match item.lease_owner with
@@ -359,7 +564,8 @@ module Memory_backend = struct
   let heartbeat t ~workflow_id ~worker_id ~now_ms ~lease_ms =
     with_lock t (fun () ->
         match Hashtbl.find_opt t.records workflow_id with
-        | Some item when owned_by item worker_id ->
+        | Some record when owned_by record.item worker_id ->
+            let item = record.item in
             let next =
               {
                 item with
@@ -367,7 +573,9 @@ module Memory_backend = struct
                 updated_at_ms = now_ms;
               }
             in
-            Hashtbl.replace t.records workflow_id next;
+            record.item <- next;
+            append_event record ~workflow_id ~kind:Workflow_heartbeat ~worker_id
+              ~occurred_at_ms:now_ms t;
             Ok true
         | _ -> Ok false)
 
@@ -381,8 +589,9 @@ module Memory_backend = struct
     else
       with_lock t (fun () ->
           match Hashtbl.find_opt t.records workflow_id with
-          | Some item when owned_by item worker_id ->
-              Hashtbl.replace t.records workflow_id
+          | Some record when owned_by record.item worker_id ->
+              let item = record.item in
+              record.item <-
                 {
                   item with
                   status;
@@ -392,14 +601,17 @@ module Memory_backend = struct
                   message = Some message;
                   updated_at_ms = now_ms;
                 };
+              append_event record ~workflow_id ~kind:Workflow_completed
+                ~worker_id ~message ~occurred_at_ms:now_ms t;
               Ok true
           | _ -> Ok false)
 
   let reschedule t ~workflow_id ~worker_id ~now_ms ~run_at_ms ~message =
     with_lock t (fun () ->
         match Hashtbl.find_opt t.records workflow_id with
-        | Some item when owned_by item worker_id ->
-            Hashtbl.replace t.records workflow_id
+        | Some record when owned_by record.item worker_id ->
+            let item = record.item in
+            record.item <-
               {
                 item with
                 status = Queued;
@@ -410,15 +622,51 @@ module Memory_backend = struct
                 message = Some message;
                 updated_at_ms = now_ms;
               };
+            append_event record ~workflow_id ~kind:Workflow_rescheduled
+              ~worker_id ~message ~occurred_at_ms:now_ms t;
             Ok true
         | _ -> Ok false)
 
   let snapshot ?tenant_id t =
     with_lock t (fun () ->
-        t.records |> Hashtbl.to_seq_values |> List.of_seq
-        |> List.filter (fun item ->
+      t.records |> Hashtbl.to_seq_values |> List.of_seq
+      |> List.map (fun record -> record.item)
+      |> List.filter (fun item ->
                match tenant_id with
                | Some tenant_id -> String.equal item.workflow.tenant_id tenant_id
                | None -> true)
         |> newest_first |> Result.ok)
+
+  let history ~workflow_id t =
+    with_lock t (fun () ->
+        Hashtbl.find_opt t.events workflow_id
+        |> Option.value ~default:[]
+        |> List.sort (fun a b -> Int.compare a.sequence b.sequence)
+        |> Result.ok)
+
+  let record_activity_result t ~now_ms result =
+    with_lock t (fun () ->
+        match Hashtbl.find_opt t.records result.workflow_id with
+        | None -> Error (`Invalid_workflow ("unknown workflow: " ^ result.workflow_id))
+        | Some record ->
+            let result = { result with updated_at_ms = now_ms } in
+            Hashtbl.replace t.activity_results
+              (activity_key ~workflow_id:result.workflow_id
+                 ~activity_id:result.activity_id)
+              result;
+            let kind =
+              match result.status with
+              | Activity_succeeded -> Activity_completed
+              | Activity_failed -> Activity_failed
+            in
+            append_event record ~workflow_id:result.workflow_id ~kind
+              ?payload_json:result.result_json ?message:result.error
+              ~occurred_at_ms:now_ms t;
+            Ok ())
+
+  let find_activity_result t ~workflow_id ~activity_id =
+    with_lock t (fun () ->
+        Hashtbl.find_opt t.activity_results
+          (activity_key ~workflow_id ~activity_id)
+        |> Result.ok)
 end

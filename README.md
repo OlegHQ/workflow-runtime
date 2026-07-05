@@ -16,6 +16,9 @@ for atomic multi-instance claims.
 - Lease expiry recovery after worker/process crashes.
 - Terminal completion as `succeeded`, `blocked`, or `failed`.
 - Durable reschedule back to `queued`.
+- Append-only ordered workflow event history for audit and replay inputs.
+- Activity result recording and lookup so retried workflow code can preserve
+  completed side effects.
 - Tenant-filtered and tenant-grouped snapshots.
 - Core runtime has no dependency on Eio, Dream, Mongo, or application domain
   types.
@@ -26,14 +29,13 @@ for atomic multi-instance claims.
 Temporal is more than a distributed status table. Its reliability comes from a
 durable Event History, task queues, workflow replay, activity result
 preservation, durable timers, retries, timeouts, and worker polling. This
-library currently implements the lower-level distributed execution foundation:
-durable state, atomic claims, leases, heartbeats, recovery, and visibility.
+library implements a smaller reusable foundation: durable state, atomic claims,
+leases, heartbeats, recovery, ordered event history, activity-result
+preservation, and visibility.
 
-Before calling this Temporal-like for complex business workflows, add:
+Before calling this fully Temporal-like for complex business workflows, add:
 
-- append-only workflow event history;
 - deterministic workflow replay over event history;
-- activity scheduling with recorded activity results;
 - retry policies and backoff;
 - durable timers;
 - signal/query APIs;

@@ -93,6 +93,72 @@ let test_multi_worker_claims_are_exclusive_and_expire () =
   in
   Alcotest.(check int) "attempt incremented" 2 recovered.item.attempt
 
+let test_history_targeted_claim_and_activity_result () =
+  let now = ref 100L in
+  let module Runtime =
+    Workflow_runtime.Make (struct
+      let now_ms () =
+        let value = !now in
+        now := Int64.add value 1L;
+        value
+    end) (Workflow_runtime.Memory_backend)
+  in
+  let backend = Workflow_runtime.Memory_backend.create () in
+  Runtime.enqueue backend (workflow "wf_1") (Workflow_runtime.enqueue_options ())
+  |> expect_ok "enqueue wf_1";
+  Runtime.enqueue backend (workflow "wf_2") (Workflow_runtime.enqueue_options ())
+  |> expect_ok "enqueue wf_2";
+  let targeted =
+    Runtime.claim_workflow backend ~workflow_id:"wf_2" ~worker_id:"worker_a"
+      ~lease_ms:1_000L
+    |> expect_ok "claim wf_2"
+    |> Option.get
+  in
+  Alcotest.(check string) "targeted claim" "wf_2" targeted.item.workflow.id;
+  Runtime.record_activity_result backend
+    Workflow_runtime.
+      {
+        activity_id = "write_blog_file";
+        workflow_id = "wf_2";
+        name = "write blog file";
+        attempt = 1;
+        status = Activity_succeeded;
+        result_json = Some {|{"sha":"abc"}|};
+        error = None;
+        updated_at_ms = 0L;
+      }
+  |> expect_ok "record activity";
+  Runtime.complete backend ~workflow_id:"wf_2" ~worker_id:"worker_a"
+    ~status:Succeeded ~message:"done"
+  |> expect_ok "complete wf_2"
+  |> Alcotest.(check bool) "completed" true;
+  let history =
+    Runtime.history backend ~workflow_id:"wf_2" |> expect_ok "history"
+  in
+  Alcotest.(check (list string))
+    "event history"
+    [
+      "workflow_enqueued";
+      "workflow_claimed";
+      "activity_completed";
+      "workflow_completed";
+    ]
+    (List.map
+       (fun event -> Workflow_runtime.event_kind_to_string event.Workflow_runtime.kind)
+       history);
+  Alcotest.(check (list int))
+    "event sequence"
+    [ 1; 2; 3; 4 ]
+    (List.map (fun event -> event.Workflow_runtime.sequence) history);
+  let result =
+    Runtime.find_activity_result backend ~workflow_id:"wf_2"
+      ~activity_id:"write_blog_file"
+    |> expect_ok "find activity"
+    |> Option.get
+  in
+  Alcotest.(check (option string))
+    "activity result preserved" (Some {|{"sha":"abc"}|}) result.result_json
+
 let test_grouping_filtering_and_reschedule () =
   let now = ref 10L in
   let module Runtime =
@@ -167,6 +233,8 @@ let () =
           Alcotest.test_case "lifecycle and stats" `Quick test_lifecycle_and_stats;
           Alcotest.test_case "multi-worker exclusive claims" `Quick
             test_multi_worker_claims_are_exclusive_and_expire;
+          Alcotest.test_case "history targeted claim and activity result" `Quick
+            test_history_targeted_claim_and_activity_result;
           Alcotest.test_case "grouping filtering and reschedule" `Quick
             test_grouping_filtering_and_reschedule;
           Alcotest.test_case "validation" `Quick test_validation;
