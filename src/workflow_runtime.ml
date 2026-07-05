@@ -54,6 +54,7 @@ type backend_capabilities = {
   queries : bool;
   history_compaction : bool;
   cancellation : bool;
+  child_workflows : bool;
 }
 
 type event_kind =
@@ -71,6 +72,7 @@ type event_kind =
   | Signal_received
   | History_compacted
   | Workflow_cancelled
+  | Child_workflow_started
 
 type event = {
   id : string;
@@ -112,6 +114,13 @@ type signal = {
   name : string;
   payload_json : string option;
   received_at_ms : int64;
+}
+
+type child_workflow = {
+  parent_workflow_id : string;
+  child_workflow_id : string;
+  child_kind : string;
+  started_at_ms : int64;
 }
 
 type retry_policy = {
@@ -156,6 +165,7 @@ type replay_state = {
   timers : replay_timer list;
   activities : replay_activity list;
   signals : signal list;
+  child_workflows : child_workflow list;
   compacted_at_sequence : int option;
 }
 
@@ -207,6 +217,7 @@ let event_kind_to_string = function
   | Signal_received -> "signal_received"
   | History_compacted -> "history_compacted"
   | Workflow_cancelled -> "workflow_cancelled"
+  | Child_workflow_started -> "child_workflow_started"
 
 let event_kind_of_string = function
   | "workflow_enqueued" -> Ok Workflow_enqueued
@@ -223,6 +234,7 @@ let event_kind_of_string = function
   | "signal_received" -> Ok Signal_received
   | "history_compacted" -> Ok History_compacted
   | "workflow_cancelled" -> Ok Workflow_cancelled
+  | "child_workflow_started" -> Ok Child_workflow_started
   | value -> Error ("unknown workflow event kind: " ^ value)
 
 let activity_status_to_string = function
@@ -356,6 +368,15 @@ let signal_to_yojson (signal : signal) =
       ("received_at_ms", int64_json signal.received_at_ms);
     ]
 
+let child_workflow_to_yojson (child : child_workflow) =
+  `Assoc
+    [
+      ("parent_workflow_id", `String child.parent_workflow_id);
+      ("child_workflow_id", `String child.child_workflow_id);
+      ("child_kind", `String child.child_kind);
+      ("started_at_ms", int64_json child.started_at_ms);
+    ]
+
 let replay_completion_to_yojson (completion : replay_completion) =
   `Assoc
     [
@@ -396,6 +417,8 @@ let replay_state_to_yojson (state : replay_state) =
       ("timers", `List (List.map replay_timer_to_yojson state.timers));
       ("activities", `List (List.map replay_activity_to_yojson state.activities));
       ("signals", `List (List.map signal_to_yojson state.signals));
+      ( "child_workflows",
+        `List (List.map child_workflow_to_yojson state.child_workflows) );
       ( "compacted_at_sequence",
         option_json (fun value -> `Int value) state.compacted_at_sequence );
     ]
@@ -437,6 +460,9 @@ let signal_payload (signal : signal) =
     ]
   |> Yojson.Safe.to_string
 
+let child_workflow_payload (child : child_workflow) =
+  child_workflow_to_yojson child |> Yojson.Safe.to_string
+
 let empty_replay_state =
   {
     workflow_id = None;
@@ -446,6 +472,7 @@ let empty_replay_state =
     timers = [];
     activities = [];
     signals = [];
+    child_workflows = [];
     compacted_at_sequence = None;
   }
 
@@ -543,6 +570,14 @@ let replay_state_of_yojson json =
         let* received_at_ms = int64_member value "received_at_ms" in
         Ok { signal_id; workflow_id; name; payload_json; received_at_ms })
   in
+  let child_workflows =
+    list_member json "child_workflows" (fun value ->
+        let* parent_workflow_id = string_member value "parent_workflow_id" in
+        let* child_workflow_id = string_member value "child_workflow_id" in
+        let* child_kind = string_member value "child_kind" in
+        let* started_at_ms = int64_member value "started_at_ms" in
+        Ok { parent_workflow_id; child_workflow_id; child_kind; started_at_ms })
+  in
   let compacted_at_sequence =
     match Yojson.Safe.Util.member "compacted_at_sequence" json with
     | `Null -> Ok None
@@ -556,6 +591,7 @@ let replay_state_of_yojson json =
   let* timers = timers in
   let* activities = activities in
   let* signals = signals in
+  let* child_workflows = child_workflows in
   let* compacted_at_sequence = compacted_at_sequence in
   Ok
     {
@@ -566,6 +602,7 @@ let replay_state_of_yojson json =
       timers;
       activities;
       signals;
+      child_workflows;
       compacted_at_sequence;
     }
 
@@ -625,6 +662,28 @@ let replay_event state (event : event) =
                 message = event.message;
                 completed_at_ms = event.occurred_at_ms;
               };
+        }
+  | Child_workflow_started ->
+      let ( let* ) = Result.bind in
+      let* json = payload_json event in
+      let* parent_workflow_id = string_member json "parent_workflow_id" in
+      let* child_workflow_id = string_member json "child_workflow_id" in
+      let* child_kind = string_member json "child_kind" in
+      let* started_at_ms = int64_member json "started_at_ms" in
+      Ok
+        {
+          state with
+          child_workflows =
+            {
+              parent_workflow_id;
+              child_workflow_id;
+              child_kind;
+              started_at_ms;
+            }
+            :: List.filter
+                 (fun existing ->
+                   not (String.equal existing.child_workflow_id child_workflow_id))
+                 state.child_workflows;
         }
   | Timer_scheduled ->
       let ( let* ) = Result.bind in
@@ -734,6 +793,11 @@ let replay events =
                List.sort
                  (fun left right -> String.compare left.signal_id right.signal_id)
                  state.signals;
+             child_workflows =
+               List.sort
+                 (fun left right ->
+                   String.compare left.child_workflow_id right.child_workflow_id)
+                 state.child_workflows;
            })
   with Invalid_argument message -> Error message
 
@@ -894,7 +958,17 @@ module type BACKEND = sig
     reason:string ->
     (bool, error) result
 
+  val start_child :
+    t ->
+    parent_workflow_id:string ->
+    worker_id:string ->
+    now_ms:int64 ->
+    workflow ->
+    enqueue_options ->
+    (bool, error) result
+
   val snapshot : ?tenant_id:string -> t -> (item list, error) result
+  val children : parent_workflow_id:string -> t -> (item list, error) result
   val history : workflow_id:string -> t -> (event list, error) result
   val timers : workflow_id:string -> t -> (timer list, error) result
   val signals : workflow_id:string -> t -> (signal list, error) result
@@ -995,7 +1069,16 @@ module type S = sig
     reason:string ->
     (bool, error) result
 
+  val start_child :
+    backend ->
+    parent_workflow_id:string ->
+    worker_id:string ->
+    workflow ->
+    enqueue_options ->
+    (bool, error) result
+
   val snapshot : ?tenant_id:string -> backend -> (item list, error) result
+  val children : parent_workflow_id:string -> backend -> (item list, error) result
   val snapshot_json : ?tenant_id:string -> ?group_by_tenant:bool -> backend -> (Yojson.Safe.t, error) result
   val history : workflow_id:string -> backend -> (event list, error) result
   val timers : workflow_id:string -> backend -> (timer list, error) result
@@ -1035,7 +1118,11 @@ module Make (Clock : CLOCK) (Backend : BACKEND) = struct
       ~name ?payload_json ()
   let cancel backend ~workflow_id ~reason =
     Backend.cancel backend ~workflow_id ~now_ms:(Clock.now_ms ()) ~reason
+  let start_child backend ~parent_workflow_id ~worker_id workflow options =
+    Backend.start_child backend ~parent_workflow_id ~worker_id
+      ~now_ms:(Clock.now_ms ()) workflow options
   let snapshot = Backend.snapshot
+  let children = Backend.children
   let history = Backend.history
   let timers = Backend.timers
   let signals = Backend.signals
@@ -1065,6 +1152,7 @@ module Memory_backend = struct
     activity_results : (string, activity_result) Hashtbl.t;
     timers : (string, timer) Hashtbl.t;
     signals : (string, signal) Hashtbl.t;
+    child_workflows : (string, child_workflow) Hashtbl.t;
   }
 
   let create () =
@@ -1075,6 +1163,7 @@ module Memory_backend = struct
       activity_results = Hashtbl.create 128;
       timers = Hashtbl.create 128;
       signals = Hashtbl.create 128;
+      child_workflows = Hashtbl.create 128;
     }
 
   let error_to_string = function
@@ -1101,11 +1190,14 @@ module Memory_backend = struct
       queries = true;
       history_compaction = true;
       cancellation = true;
+      child_workflows = true;
     }
 
   let activity_key ~workflow_id ~activity_id = workflow_id ^ "\000" ^ activity_id
   let timer_key ~workflow_id ~timer_id = workflow_id ^ "\000" ^ timer_id
   let signal_key ~workflow_id ~signal_id = workflow_id ^ "\000" ^ signal_id
+  let child_key ~parent_workflow_id ~child_workflow_id =
+    parent_workflow_id ^ "\000" ^ child_workflow_id
 
   let append_event record ~workflow_id ~kind ?worker_id ?payload_json ?message
       ~occurred_at_ms t =
@@ -1412,6 +1504,16 @@ module Memory_backend = struct
                | None -> true)
         |> newest_first |> Result.ok)
 
+  let children ~parent_workflow_id t =
+    with_lock t (fun () ->
+        t.child_workflows |> Hashtbl.to_seq_values |> List.of_seq
+        |> List.filter (fun (child : child_workflow) ->
+               String.equal child.parent_workflow_id parent_workflow_id)
+        |> List.filter_map (fun child ->
+               Hashtbl.find_opt t.records child.child_workflow_id
+               |> Option.map (fun record -> record.item))
+        |> newest_first |> Result.ok)
+
   let history ~workflow_id t =
     with_lock t (fun () ->
         Hashtbl.find_opt t.events workflow_id
@@ -1529,6 +1631,61 @@ module Memory_backend = struct
             append_event record ~workflow_id ~kind:Workflow_cancelled
               ~message:reason ~occurred_at_ms:now_ms t;
             Ok true)
+
+  let start_child t ~parent_workflow_id ~worker_id ~now_ms workflow
+      (options : enqueue_options) =
+    match validate_workflow workflow with
+    | Error message -> Error (`Invalid_workflow message)
+    | Ok () ->
+        with_lock t (fun () ->
+            match Hashtbl.find_opt t.records parent_workflow_id with
+            | None -> Error (`Invalid_workflow ("unknown parent workflow: " ^ parent_workflow_id))
+            | Some parent when terminal_status parent.item.status -> Ok false
+            | Some parent when not (owned_by parent.item worker_id) -> Ok false
+            | Some parent ->
+                let key =
+                  child_key ~parent_workflow_id
+                    ~child_workflow_id:workflow.id
+                in
+                if Hashtbl.mem t.child_workflows key then Ok true
+                else if Hashtbl.mem t.records workflow.id then
+                  Error (`Duplicate_workflow workflow.id)
+                else
+                  let item =
+                    {
+                      workflow;
+                      status = Queued;
+                      run_at_ms = options.run_at_ms;
+                      attempt = 0;
+                      lease_owner = None;
+                      lease_expires_at_ms = None;
+                      payload_json = options.payload_json;
+                      started_at_ms = None;
+                      finished_at_ms = None;
+                      message = None;
+                      created_at_ms = now_ms;
+                      updated_at_ms = now_ms;
+                    }
+                  in
+                  let child_record = { item; event_sequence = 0 } in
+                  Hashtbl.add t.records workflow.id child_record;
+                  append_event child_record ~workflow_id:workflow.id
+                    ~kind:Workflow_enqueued ?payload_json:options.payload_json
+                    ~occurred_at_ms:now_ms t;
+                  let child =
+                    {
+                      parent_workflow_id;
+                      child_workflow_id = workflow.id;
+                      child_kind = workflow.kind;
+                      started_at_ms = now_ms;
+                    }
+                  in
+                  Hashtbl.replace t.child_workflows key child;
+                  append_event parent ~workflow_id:parent_workflow_id
+                    ~kind:Child_workflow_started
+                    ~payload_json:(child_workflow_payload child)
+                    ~message:workflow.id ~occurred_at_ms:now_ms t;
+                  Ok true)
 
   let record_activity_result t ~now_ms (result : activity_result) =
     with_lock t (fun () ->

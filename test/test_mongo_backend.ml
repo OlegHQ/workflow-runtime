@@ -674,6 +674,107 @@ let test_mongo_cancellation_across_backend_instances () =
       Alcotest.(check (option string)) "replay reason"
         (Some "user requested stop") completion.message)
 
+let test_mongo_child_workflows_can_nest_across_backend_instances () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let config =
+    Mongo_config.
+      {
+        (default ~host ~port ~database:db ()) with
+        direct_connection = true;
+        server_selection_timeout_ms = 2_000;
+        connect_timeout_ms = 2_000;
+        socket_timeout_ms = Some 5_000;
+        app_name = Some "workflow-runtime-e2e";
+      }
+  in
+  let client =
+    match
+      Mongo_eio.connect ~sw ~net:(Eio.Stdenv.net env)
+        ~clock:(Eio.Stdenv.clock env) ~config
+    with
+    | Ok client -> client
+    | Error error ->
+        Alcotest.fail ("connect: " ^ Mongo_error.to_string error)
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      let _ =
+        Mongo_eio.direct_run_command client db
+          [ ("dropDatabase", Bson.create_int32 1l) ]
+      in
+      Mongo_eio.close_direct client)
+    (fun () ->
+      let backend_a =
+        Workflow_runtime_mongo.create ~client ~db ~collection:"child_workflows" ()
+      in
+      let backend_b =
+        Workflow_runtime_mongo.create ~client ~db ~collection:"child_workflows" ()
+      in
+      Workflow_runtime_mongo.ensure backend_a |> expect_ok "ensure";
+      let capabilities = Workflow_runtime_mongo.capabilities backend_a in
+      Alcotest.(check bool) "child workflows" true capabilities.child_workflows;
+      Workflow_runtime_mongo.enqueue backend_a ~now_ms:8_000L
+        (workflow_kind "wf_parent" "root")
+        (Workflow_runtime.enqueue_options ~run_at_ms:8_000L ())
+      |> expect_ok "enqueue parent";
+      Workflow_runtime_mongo.claim_workflow backend_a ~workflow_id:"wf_parent"
+        ~worker_id:"parent_worker" ~now_ms:8_001L ~lease_ms:10_000L
+      |> expect_ok "claim parent"
+      |> Option.get
+      |> ignore;
+      Workflow_runtime_mongo.start_child backend_a ~parent_workflow_id:"wf_parent"
+        ~worker_id:"parent_worker" ~now_ms:8_002L
+        (workflow_kind "wf_child" "child_step")
+        (Workflow_runtime.enqueue_options ~payload_json:{|{"step":1}|} ())
+      |> expect_ok "start child"
+      |> Alcotest.(check bool) "child started" true;
+      Workflow_runtime_mongo.start_child backend_a ~parent_workflow_id:"wf_parent"
+        ~worker_id:"parent_worker" ~now_ms:8_003L
+        (workflow_kind "wf_child" "child_step")
+        (Workflow_runtime.enqueue_options ~payload_json:{|{"step":1}|} ())
+      |> expect_ok "start duplicate child"
+      |> Alcotest.(check bool) "duplicate child idempotent" true;
+      let children =
+        Workflow_runtime_mongo.children ~parent_workflow_id:"wf_parent" backend_b
+        |> expect_ok "children"
+      in
+      Alcotest.(check int) "one child" 1 (List.length children);
+      Alcotest.(check string) "child id" "wf_child"
+        (List.hd children).Workflow_runtime.workflow.id;
+      Workflow_runtime_mongo.claim_workflow backend_b ~workflow_id:"wf_child"
+        ~worker_id:"child_worker" ~now_ms:8_004L ~lease_ms:10_000L
+      |> expect_ok "claim child"
+      |> Option.get
+      |> ignore;
+      Workflow_runtime_mongo.start_child backend_b ~parent_workflow_id:"wf_child"
+        ~worker_id:"child_worker" ~now_ms:8_005L
+        (workflow_kind "wf_grandchild" "grandchild_step")
+        (Workflow_runtime.enqueue_options ())
+      |> expect_ok "start grandchild"
+      |> Alcotest.(check bool) "grandchild started" true;
+      let grandchildren =
+        Workflow_runtime_mongo.children ~parent_workflow_id:"wf_child" backend_a
+        |> expect_ok "grandchildren"
+      in
+      Alcotest.(check int) "one grandchild" 1 (List.length grandchildren);
+      Alcotest.(check string) "grandchild id" "wf_grandchild"
+        (List.hd grandchildren).Workflow_runtime.workflow.id;
+      let parent_state =
+        Workflow_runtime_mongo.query_state ~workflow_id:"wf_parent" backend_b
+        |> expect_ok "query parent"
+        |> Option.get
+      in
+      Alcotest.(check int) "parent replay child count" 1
+        (List.length parent_state.child_workflows);
+      let child_state =
+        Workflow_runtime_mongo.query_state ~workflow_id:"wf_child" backend_a
+        |> expect_ok "query child"
+        |> Option.get
+      in
+      Alcotest.(check int) "child replay child count" 1
+        (List.length child_state.child_workflows))
+
 let () =
   Mirage_crypto_rng_unix.use_default ();
   Alcotest.run "workflow-runtime-mongo"
@@ -694,5 +795,8 @@ let () =
             test_mongo_signals_queries_and_compaction_across_backend_instances;
           Alcotest.test_case "cancellation across backend instances" `Quick
             test_mongo_cancellation_across_backend_instances;
+          Alcotest.test_case "child workflows can nest across backend instances"
+            `Quick
+            test_mongo_child_workflows_can_nest_across_backend_instances;
         ] );
     ]

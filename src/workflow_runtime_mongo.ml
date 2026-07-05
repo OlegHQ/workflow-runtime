@@ -11,6 +11,7 @@ type t = {
   activity_results_collection : string;
   timers_collection : string;
   signals_collection : string;
+  child_workflows_collection : string;
 }
 
 let create ~client ~db ~collection () =
@@ -22,6 +23,7 @@ let create ~client ~db ~collection () =
     activity_results_collection = collection ^ "_activity_results";
     timers_collection = collection ^ "_timers";
     signals_collection = collection ^ "_signals";
+    child_workflows_collection = collection ^ "_child_workflows";
   }
 
 let error_to_string = function
@@ -44,6 +46,7 @@ let capabilities _ =
       queries = true;
       history_compaction = true;
       cancellation = true;
+      child_workflows = true;
     }
 
 let mongo_error error = `Mongo (Mongo_error.to_string error)
@@ -116,6 +119,15 @@ type signal_doc = {
   name : string;
   payload_json : string option;
   received_at_ms : int64;
+}
+[@@deriving bson]
+
+type child_workflow_doc = {
+  id : string; [@bson.key "_id"]
+  parent_workflow_id : string;
+  child_workflow_id : string;
+  child_kind : string;
+  started_at_ms : int64;
 }
 [@@deriving bson]
 
@@ -305,6 +317,30 @@ let signal_of_doc (doc : signal_doc) =
       received_at_ms = doc.received_at_ms;
     }
 
+let child_workflow_key ~parent_workflow_id ~child_workflow_id =
+  parent_workflow_id ^ ":" ^ child_workflow_id
+
+let child_workflow_doc_of_child (child : Workflow_runtime.child_workflow) =
+  ({
+     id =
+       child_workflow_key ~parent_workflow_id:child.parent_workflow_id
+         ~child_workflow_id:child.child_workflow_id;
+     parent_workflow_id = child.parent_workflow_id;
+     child_workflow_id = child.child_workflow_id;
+     child_kind = child.child_kind;
+     started_at_ms = child.started_at_ms;
+   }
+    : child_workflow_doc)
+
+let child_of_doc (doc : child_workflow_doc) =
+  Workflow_runtime.
+    {
+      parent_workflow_id = doc.parent_workflow_id;
+      child_workflow_id = doc.child_workflow_id;
+      child_kind = doc.child_kind;
+      started_at_ms = doc.started_at_ms;
+    }
+
 let decode_workflow_doc bson =
   match workflow_doc_of_bson_doc_result bson with
   | Error message -> Error (`Bad_document message)
@@ -334,6 +370,11 @@ let decode_signal bson =
   match signal_doc_of_bson_doc_result bson with
   | Error message -> Error (`Bad_document message)
   | Ok doc -> Ok (signal_of_doc doc)
+
+let decode_child bson =
+  match child_workflow_doc_of_bson_doc_result bson with
+  | Error message -> Error (`Bad_document message)
+  | Ok doc -> Ok (child_of_doc doc)
 
 let index_key fields =
   Bson.add_element "key" (Bson.create_doc_element (doc fields)) Bson.empty
@@ -396,6 +437,13 @@ let ensure t =
       [ Mongo_index.Name "workflow_signal_id_idx"; Mongo_index.Unique true ]
     |> Result.map_error mongo_error
   in
+  let* () =
+    Mongo_eio.direct_ensure_index t.client ~db:t.db
+      ~collection:t.child_workflows_collection
+      (index_key [ int32 "parent_workflow_id" 1; int32 "child_workflow_id" 1 ])
+      [ Mongo_index.Name "workflow_child_id_idx"; Mongo_index.Unique true ]
+    |> Result.map_error mongo_error
+  in
   Ok ()
 
 let event_id ~workflow_id ~sequence = workflow_id ^ ":" ^ string_of_int sequence
@@ -456,6 +504,9 @@ let signal_payload (signal : Workflow_runtime.signal) =
       ("payload_json", string_option_json signal.payload_json);
     ]
   |> Yojson.Safe.to_string
+
+let child_workflow_payload (child : Workflow_runtime.child_workflow) =
+  Workflow_runtime.child_workflow_to_yojson child |> Yojson.Safe.to_string
 
 let non_terminal_status_filter =
   doc_element "status"
@@ -921,6 +972,52 @@ let snapshot ?tenant_id t =
         (Ok []) docs
       |> Result.map List.rev
 
+let children ~parent_workflow_id t =
+  let filter = doc [ string "parent_workflow_id" parent_workflow_id ] in
+  let opts =
+    {
+      (Mongo_crud.default_find t.child_workflows_collection filter) with
+      sort = Some (doc [ int32 "started_at_ms" (-1); int32 "child_workflow_id" 1 ]);
+    }
+  in
+  Mongo_eio.direct_find t.client ~db:t.db
+    ~collection:t.child_workflows_collection opts
+  |> Result.map_error mongo_error
+  |> function
+  | Error _ as error -> error
+  | Ok docs ->
+      let ( let* ) = Result.bind in
+      let* children =
+        List.fold_left
+          (fun acc bson ->
+            match acc with
+            | Error _ as error -> error
+            | Ok children -> (
+                match decode_child bson with
+                | Ok child -> Ok (child :: children)
+                | Error _ as error -> error))
+          (Ok []) docs
+        |> Result.map List.rev
+      in
+      List.fold_left
+        (fun acc (child : Workflow_runtime.child_workflow) ->
+          match acc with
+          | Error _ as error -> error
+          | Ok items -> (
+              Mongo_eio.direct_find_one t.client ~db:t.db
+                ~collection:t.workflows_collection
+                (doc [ string "_id" child.child_workflow_id ])
+              |> Result.map_error mongo_error
+              |> function
+              | Error _ as error -> error
+              | Ok None -> Ok items
+              | Ok (Some bson) -> (
+                  match decode_item bson with
+                  | Ok item -> Ok (item :: items)
+                  | Error _ as error -> error)))
+        (Ok []) children
+      |> Result.map List.rev
+
 let history ~workflow_id t =
   let filter = doc [ string "workflow_id" workflow_id ] in
   let opts =
@@ -1130,6 +1227,136 @@ let cancel t ~workflow_id ~now_ms ~reason =
         ~payload_json:(cancel_payload ~reason) ~message:reason
         ~occurred_at_ms:now_ms ()
       |> Result.map (fun () -> true)
+
+let find_child_link t ~parent_workflow_id ~child_workflow_id =
+  Mongo_eio.direct_find_one t.client ~db:t.db
+    ~collection:t.child_workflows_collection
+    (doc
+       [
+         string "_id"
+           (child_workflow_key ~parent_workflow_id ~child_workflow_id);
+       ])
+  |> Result.map_error mongo_error
+  |> function
+  | Error _ as error -> error
+  | Ok None -> Ok None
+  | Ok (Some bson) -> decode_child bson |> Result.map Option.some
+
+let child_started_event_exists t ~parent_workflow_id ~child_workflow_id =
+  let ( let* ) = Result.bind in
+  let* events = history ~workflow_id:parent_workflow_id t in
+  Ok
+    (List.exists
+       (fun (event : Workflow_runtime.event) ->
+         match (event.kind, event.message) with
+         | Child_workflow_started, Some message ->
+             String.equal message child_workflow_id
+         | _ -> false)
+       events)
+
+let ensure_child_started_event t ~parent_workflow_id ~worker_id
+    (child : Workflow_runtime.child_workflow) =
+  let ( let* ) = Result.bind in
+  let* exists =
+    child_started_event_exists t ~parent_workflow_id
+      ~child_workflow_id:child.child_workflow_id
+  in
+  if exists then Ok true
+  else
+    let update = doc [ doc_element "$inc" (doc [ int32 "event_sequence" 1 ]) ] in
+    update_owned t ~workflow_id:parent_workflow_id ~worker_id update
+    |> function
+    | Error _ as error -> error
+    | Ok None -> Ok false
+    | Ok (Some sequence) ->
+        append_event t ~workflow_id:parent_workflow_id ~sequence
+          ~kind:Workflow_runtime.Child_workflow_started ~worker_id
+          ~payload_json:(child_workflow_payload child)
+          ~message:child.child_workflow_id ~occurred_at_ms:child.started_at_ms ()
+        |> Result.map (fun () -> true)
+
+let start_child t ~parent_workflow_id ~worker_id ~now_ms
+    (workflow : Workflow_runtime.workflow)
+    (options : Workflow_runtime.enqueue_options) =
+  let ( let* ) = Result.bind in
+  let* parent =
+    Mongo_eio.direct_find_one t.client ~db:t.db
+      ~collection:t.workflows_collection
+      (owned_query ~workflow_id:parent_workflow_id ~worker_id)
+    |> Result.map_error mongo_error
+    |> function
+    | Error _ as error -> error
+    | Ok None -> Ok None
+    | Ok (Some bson) -> decode_item bson |> Result.map Option.some
+  in
+  match parent with
+  | None -> Ok false
+  | Some parent when
+      (match parent.Workflow_runtime.status with
+      | Succeeded | Blocked | Failed | Cancelled -> true
+      | Queued | Running -> false) ->
+      Ok false
+  | Some _ ->
+      let* existing_child =
+        find_child_link t ~parent_workflow_id ~child_workflow_id:workflow.id
+      in
+      if Option.is_some existing_child then
+        ensure_child_started_event t ~parent_workflow_id ~worker_id
+          (Option.get existing_child)
+      else
+        let item =
+          Workflow_runtime.
+            {
+              workflow;
+              status = Queued;
+              run_at_ms = options.run_at_ms;
+              attempt = 0;
+              lease_owner = None;
+              lease_expires_at_ms = None;
+              payload_json = options.payload_json;
+              started_at_ms = None;
+              finished_at_ms = None;
+              message = None;
+              created_at_ms = now_ms;
+              updated_at_ms = now_ms;
+            }
+        in
+        let workflow_doc =
+          { (workflow_doc_of_item item) with event_sequence = Some 1 }
+        in
+        let child =
+          Workflow_runtime.
+            {
+              parent_workflow_id;
+              child_workflow_id = workflow.id;
+              child_kind = workflow.kind;
+              started_at_ms = now_ms;
+            }
+        in
+        let child_doc = child_workflow_doc_of_child child in
+        let* () =
+          Mongo_eio.direct_insert_one t.client ~db:t.db
+            ~collection:t.workflows_collection
+            (workflow_doc_to_bson_doc workflow_doc)
+          |> Result.map (fun _ -> ())
+          |> Result.map_error (fun error ->
+                 if Mongo_error.is_duplicate_key error then
+                   `Duplicate_workflow workflow.Workflow_runtime.id
+                 else mongo_error error)
+        in
+        let* () =
+          append_event t ~workflow_id:workflow.id ~sequence:1
+            ~kind:Workflow_runtime.Workflow_enqueued
+            ?payload_json:options.payload_json ~occurred_at_ms:now_ms ()
+        in
+        let* () =
+          Mongo_eio.direct_insert_one t.client ~db:t.db
+            ~collection:t.child_workflows_collection
+            (child_workflow_doc_to_bson_doc child_doc)
+          |> Result.map (fun _ -> ())
+          |> Result.map_error mongo_error
+        in
+        ensure_child_started_event t ~parent_workflow_id ~worker_id child
 
 let record_activity_result t ~now_ms (result : Workflow_runtime.activity_result) =
   let result = { result with Workflow_runtime.updated_at_ms = now_ms } in

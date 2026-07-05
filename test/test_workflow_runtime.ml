@@ -478,6 +478,81 @@ let test_cancellation_is_terminal_and_replayable () =
   Alcotest.(check (option string)) "replay reason"
     (Some "user requested stop") completion.message
 
+let test_child_workflows_can_nest_and_replay () =
+  let now = ref 40_000L in
+  let module Runtime =
+    Workflow_runtime.Make (struct
+      let now_ms () =
+        let value = !now in
+        now := Int64.add value 1L;
+        value
+    end) (Workflow_runtime.Memory_backend)
+  in
+  let backend = Workflow_runtime.Memory_backend.create () in
+  let capabilities = Runtime.capabilities backend in
+  Alcotest.(check bool) "child workflows" true capabilities.child_workflows;
+  Runtime.enqueue backend (workflow "parent_wf") (Workflow_runtime.enqueue_options ())
+  |> expect_ok "enqueue parent";
+  Runtime.claim_workflow backend ~workflow_id:"parent_wf" ~worker_id:"parent_worker"
+    ~lease_ms:10_000L
+  |> expect_ok "claim parent"
+  |> Option.get
+  |> ignore;
+  let child =
+    Workflow_runtime.{ (workflow "child_wf") with kind = "child_step" }
+  in
+  Runtime.start_child backend ~parent_workflow_id:"parent_wf"
+    ~worker_id:"parent_worker" child
+    (Workflow_runtime.enqueue_options ~payload_json:{|{"step":1}|} ())
+  |> expect_ok "start child"
+  |> Alcotest.(check bool) "child started" true;
+  Runtime.start_child backend ~parent_workflow_id:"parent_wf"
+    ~worker_id:"parent_worker" child
+    (Workflow_runtime.enqueue_options ~payload_json:{|{"step":1}|} ())
+  |> expect_ok "start duplicate child"
+  |> Alcotest.(check bool) "duplicate child idempotent" true;
+  let children =
+    Runtime.children backend ~parent_workflow_id:"parent_wf"
+    |> expect_ok "children"
+  in
+  Alcotest.(check int) "one child" 1 (List.length children);
+  Alcotest.(check string) "child id" "child_wf"
+    (List.hd children).Workflow_runtime.workflow.id;
+  Runtime.claim_workflow backend ~workflow_id:"child_wf" ~worker_id:"child_worker"
+    ~lease_ms:10_000L
+  |> expect_ok "claim child"
+  |> Option.get
+  |> ignore;
+  let grandchild =
+    Workflow_runtime.{ (workflow "grandchild_wf") with kind = "grandchild_step" }
+  in
+  Runtime.start_child backend ~parent_workflow_id:"child_wf"
+    ~worker_id:"child_worker" grandchild
+    (Workflow_runtime.enqueue_options ())
+  |> expect_ok "start grandchild"
+  |> Alcotest.(check bool) "grandchild started" true;
+  let grandchildren =
+    Runtime.children backend ~parent_workflow_id:"child_wf"
+    |> expect_ok "grandchildren"
+  in
+  Alcotest.(check int) "one grandchild" 1 (List.length grandchildren);
+  Alcotest.(check string) "grandchild id" "grandchild_wf"
+    (List.hd grandchildren).Workflow_runtime.workflow.id;
+  let parent_state =
+    Runtime.query_state backend ~workflow_id:"parent_wf"
+    |> expect_ok "query parent"
+    |> Option.get
+  in
+  Alcotest.(check int) "parent replay child count" 1
+    (List.length parent_state.child_workflows);
+  let child_state =
+    Runtime.query_state backend ~workflow_id:"child_wf"
+    |> expect_ok "query child"
+    |> Option.get
+  in
+  Alcotest.(check int) "child replay child count" 1
+    (List.length child_state.child_workflows)
+
 let test_grouping_filtering_and_reschedule () =
   let now = ref 10L in
   let module Runtime =
@@ -562,6 +637,8 @@ let () =
             test_signals_queries_and_history_compaction;
           Alcotest.test_case "cancellation is terminal and replayable" `Quick
             test_cancellation_is_terminal_and_replayable;
+          Alcotest.test_case "child workflows can nest and replay" `Quick
+            test_child_workflows_can_nest_and_replay;
           Alcotest.test_case "grouping filtering and reschedule" `Quick
             test_grouping_filtering_and_reschedule;
           Alcotest.test_case "validation" `Quick test_validation;
