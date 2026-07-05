@@ -48,6 +48,7 @@ type backend_capabilities = {
   task_queue_filtering : bool;
   retry_backoff : bool;
   durable_timers : bool;
+  deterministic_replay : bool;
 }
 
 type event_kind =
@@ -107,6 +108,38 @@ type retry_policy = {
 type retry_decision =
   | Retried of { attempt : int; run_at_ms : int64 }
   | Retries_exhausted of { attempt : int }
+
+type replay_completion = {
+  status : status;
+  message : string option;
+  completed_at_ms : int64;
+}
+
+type replay_timer = {
+  timer_id : string;
+  run_at_ms : int64;
+  scheduled_at_ms : int64;
+  fired_at_ms : int64 option;
+}
+
+type replay_activity = {
+  activity_id : string;
+  name : string;
+  attempt : int;
+  status : activity_status;
+  result_json : string option;
+  error : string option;
+  completed_at_ms : int64;
+}
+
+type replay_state = {
+  workflow_id : string option;
+  enqueued_at_ms : int64 option;
+  claim_count : int;
+  completion : replay_completion option;
+  timers : replay_timer list;
+  activities : replay_activity list;
+}
 
 let enqueue_options ?(run_at_ms = 0L) ?payload_json () =
   { run_at_ms; payload_json }
@@ -190,6 +223,39 @@ let newest_first (items : item list) =
 
 let int64_json value = `Intlit (Int64.to_string value)
 let option_json f = function Some value -> f value | None -> `Null
+let string_option_json = option_json (fun value -> `String value)
+
+let string_option_member json name =
+  match Yojson.Safe.Util.member name json with
+  | `Null -> Ok None
+  | `String value -> Ok (Some value)
+  | _ -> Error ("expected string or null field: " ^ name)
+
+let string_member json name =
+  match Yojson.Safe.Util.member name json with
+  | `String value -> Ok value
+  | _ -> Error ("expected string field: " ^ name)
+
+let int_member json name =
+  match Yojson.Safe.Util.member name json with
+  | `Int value -> Ok value
+  | _ -> Error ("expected int field: " ^ name)
+
+let int64_member json name =
+  match Yojson.Safe.Util.member name json with
+  | `Int value -> Ok (Int64.of_int value)
+  | `Intlit value -> (
+      match Int64.of_string_opt value with
+      | Some value -> Ok value
+      | None -> Error ("expected int64 field: " ^ name))
+  | _ -> Error ("expected int64 field: " ^ name)
+
+let payload_json (event : event) =
+  match event.payload_json with
+  | None -> Error ("event missing payload: " ^ event_kind_to_string event.kind)
+  | Some payload -> (
+      try Ok (Yojson.Safe.from_string payload)
+      with Yojson.Json_error message -> Error message)
 
 let item_to_yojson item =
   let workflow = item.workflow in
@@ -208,7 +274,7 @@ let item_to_yojson item =
       ("attempt", `Int item.attempt);
       ("lease_owner", option_json (fun value -> `String value) item.lease_owner);
       ("lease_expires_at_ms", option_json int64_json item.lease_expires_at_ms);
-      ("payload_json", option_json (fun value -> `String value) item.payload_json);
+      ("payload_json", string_option_json item.payload_json);
       ("started_at_ms", option_json int64_json item.started_at_ms);
       ("finished_at_ms", option_json int64_json item.finished_at_ms);
       ("message", option_json (fun value -> `String value) item.message);
@@ -216,20 +282,20 @@ let item_to_yojson item =
       ("updated_at_ms", int64_json item.updated_at_ms);
     ]
 
-let event_to_yojson event =
+let event_to_yojson (event : event) =
   `Assoc
     [
       ("id", `String event.id);
       ("workflow_id", `String event.workflow_id);
       ("sequence", `Int event.sequence);
       ("kind", `String (event_kind_to_string event.kind));
-      ("worker_id", option_json (fun value -> `String value) event.worker_id);
-      ("payload_json", option_json (fun value -> `String value) event.payload_json);
-      ("message", option_json (fun value -> `String value) event.message);
+      ("worker_id", string_option_json event.worker_id);
+      ("payload_json", string_option_json event.payload_json);
+      ("message", string_option_json event.message);
       ("occurred_at_ms", int64_json event.occurred_at_ms);
     ]
 
-let activity_result_to_yojson result =
+let activity_result_to_yojson (result : activity_result) =
   `Assoc
     [
       ("activity_id", `String result.activity_id);
@@ -237,22 +303,227 @@ let activity_result_to_yojson result =
       ("name", `String result.name);
       ("attempt", `Int result.attempt);
       ("status", `String (activity_status_to_string result.status));
-      ("result_json", option_json (fun value -> `String value) result.result_json);
-      ("error", option_json (fun value -> `String value) result.error);
+      ("result_json", string_option_json result.result_json);
+      ("error", string_option_json result.error);
       ("updated_at_ms", int64_json result.updated_at_ms);
     ]
 
-let timer_to_yojson timer =
+let timer_to_yojson (timer : timer) =
   `Assoc
     [
       ("timer_id", `String timer.timer_id);
       ("workflow_id", `String timer.workflow_id);
       ("run_at_ms", int64_json timer.run_at_ms);
-      ("payload_json", option_json (fun value -> `String value) timer.payload_json);
+      ("payload_json", string_option_json timer.payload_json);
       ("fired_at_ms", option_json int64_json timer.fired_at_ms);
       ("created_at_ms", int64_json timer.created_at_ms);
       ("updated_at_ms", int64_json timer.updated_at_ms);
     ]
+
+let replay_completion_to_yojson (completion : replay_completion) =
+  `Assoc
+    [
+      ("status", `String (status_to_string completion.status));
+      ("message", string_option_json completion.message);
+      ("completed_at_ms", int64_json completion.completed_at_ms);
+    ]
+
+let replay_timer_to_yojson (timer : replay_timer) =
+  `Assoc
+    [
+      ("timer_id", `String timer.timer_id);
+      ("run_at_ms", int64_json timer.run_at_ms);
+      ("scheduled_at_ms", int64_json timer.scheduled_at_ms);
+      ("fired_at_ms", option_json int64_json timer.fired_at_ms);
+    ]
+
+let replay_activity_to_yojson (activity : replay_activity) =
+  `Assoc
+    [
+      ("activity_id", `String activity.activity_id);
+      ("name", `String activity.name);
+      ("attempt", `Int activity.attempt);
+      ("status", `String (activity_status_to_string activity.status));
+      ("result_json", string_option_json activity.result_json);
+      ("error", string_option_json activity.error);
+      ("completed_at_ms", int64_json activity.completed_at_ms);
+    ]
+
+let replay_state_to_yojson (state : replay_state) =
+  `Assoc
+    [
+      ("workflow_id", string_option_json state.workflow_id);
+      ("enqueued_at_ms", option_json int64_json state.enqueued_at_ms);
+      ("claim_count", `Int state.claim_count);
+      ( "completion",
+        option_json replay_completion_to_yojson state.completion );
+      ("timers", `List (List.map replay_timer_to_yojson state.timers));
+      ("activities", `List (List.map replay_activity_to_yojson state.activities));
+    ]
+
+let completion_payload ~status ~message =
+  `Assoc
+    [
+      ("status", `String (status_to_string status));
+      ("message", string_option_json (Some message));
+    ]
+  |> Yojson.Safe.to_string
+
+let timer_payload ~timer_id ~run_at_ms =
+  `Assoc
+    [
+      ("timer_id", `String timer_id);
+      ("run_at_ms", int64_json run_at_ms);
+    ]
+  |> Yojson.Safe.to_string
+
+let activity_payload (result : activity_result) =
+  `Assoc
+    [
+      ("activity_id", `String result.activity_id);
+      ("name", `String result.name);
+      ("attempt", `Int result.attempt);
+      ("status", `String (activity_status_to_string result.status));
+      ("result_json", string_option_json result.result_json);
+      ("error", string_option_json result.error);
+    ]
+  |> Yojson.Safe.to_string
+
+let empty_replay_state =
+  {
+    workflow_id = None;
+    enqueued_at_ms = None;
+    claim_count = 0;
+    completion = None;
+    timers = [];
+    activities = [];
+  }
+
+let upsert_timer timers timer =
+  timer :: List.filter (fun existing -> not (String.equal existing.timer_id timer.timer_id)) timers
+
+let fire_timer timers ~timer_id ~fired_at_ms =
+  List.map
+    (fun timer ->
+      if String.equal timer.timer_id timer_id then { timer with fired_at_ms = Some fired_at_ms }
+      else timer)
+    timers
+
+let replay_event state (event : event) =
+  let workflow_id =
+    match state.workflow_id with
+    | None -> Some event.workflow_id
+    | Some existing when String.equal existing event.workflow_id -> Some existing
+    | Some existing ->
+        invalid_arg
+          ("history contains multiple workflow ids: " ^ existing ^ " and "
+         ^ event.workflow_id)
+  in
+  let state = { state with workflow_id } in
+  match event.kind with
+  | Workflow_enqueued ->
+      Ok { state with enqueued_at_ms = Some event.occurred_at_ms }
+  | Workflow_claimed ->
+      Ok { state with claim_count = state.claim_count + 1 }
+  | Workflow_completed ->
+      let ( let* ) = Result.bind in
+      let* json = payload_json event in
+      let* status =
+        let* status = string_member json "status" in
+        status_of_string status
+      in
+      let* message = string_option_member json "message" in
+      Ok
+        {
+          state with
+          completion =
+            Some { status; message; completed_at_ms = event.occurred_at_ms };
+        }
+  | Timer_scheduled ->
+      let ( let* ) = Result.bind in
+      let* json = payload_json event in
+      let* timer_id = string_member json "timer_id" in
+      let* run_at_ms = int64_member json "run_at_ms" in
+      Ok
+        {
+          state with
+          timers =
+            upsert_timer state.timers
+              { timer_id; run_at_ms; scheduled_at_ms = event.occurred_at_ms; fired_at_ms = None };
+        }
+  | Timer_fired -> (
+      match event.message with
+      | Some timer_id ->
+          Ok
+            {
+              state with
+              timers = fire_timer state.timers ~timer_id ~fired_at_ms:event.occurred_at_ms;
+            }
+      | None -> Error "timer_fired event missing timer id message")
+  | Activity_completed | Activity_failed ->
+      let ( let* ) = Result.bind in
+      let* json = payload_json event in
+      let* activity_id = string_member json "activity_id" in
+      let* name = string_member json "name" in
+      let* attempt = int_member json "attempt" in
+      let* status =
+        let* status = string_member json "status" in
+        activity_status_of_string status
+      in
+      let* result_json = string_option_member json "result_json" in
+      let* error = string_option_member json "error" in
+      Ok
+        {
+          state with
+          activities =
+            {
+              activity_id;
+              name;
+              attempt;
+              status;
+              result_json;
+              error;
+              completed_at_ms = event.occurred_at_ms;
+            }
+            :: List.filter
+                 (fun existing ->
+                   not (String.equal existing.activity_id activity_id))
+                 state.activities;
+        }
+  | Workflow_heartbeat | Workflow_rescheduled | Activity_scheduled
+  | Activity_started ->
+      Ok state
+
+let replay events =
+  let sorted =
+    List.sort
+      (fun left right -> Int.compare left.sequence right.sequence)
+      events
+  in
+  try
+    List.fold_left
+      (fun acc event ->
+        match acc with
+        | Error _ as error -> error
+        | Ok state -> replay_event state event)
+      (Ok empty_replay_state) sorted
+    |> Result.map (fun state ->
+           {
+             state with
+             timers =
+               List.sort
+                 (fun left right ->
+                   let by_due = Int64.compare left.run_at_ms right.run_at_ms in
+                   if by_due <> 0 then by_due
+                   else String.compare left.timer_id right.timer_id)
+                 state.timers;
+             activities =
+               List.sort
+                 (fun left right ->
+                   String.compare left.activity_id right.activity_id)
+                 state.activities;
+           })
+  with Invalid_argument message -> Error message
 
 let empty_stats =
   { total = 0; queued = 0; running = 0; succeeded = 0; blocked = 0; failed = 0 }
@@ -554,6 +825,7 @@ module Memory_backend = struct
       task_queue_filtering = true;
       retry_backoff = true;
       durable_timers = false;
+      deterministic_replay = true;
     }
 
   let activity_key ~workflow_id ~activity_id = workflow_id ^ "\000" ^ activity_id
@@ -630,14 +902,14 @@ module Memory_backend = struct
 
   let fire_due_timers t record ~now_ms =
     t.timers |> Hashtbl.to_seq_values |> List.of_seq
-    |> List.filter (fun timer ->
+    |> List.filter (fun (timer : timer) ->
            String.equal timer.workflow_id record.item.workflow.id
            && timer.run_at_ms <= now_ms
            && Option.is_none timer.fired_at_ms)
-    |> List.sort (fun a b ->
+    |> List.sort (fun (a : timer) (b : timer) ->
            let by_due = Int64.compare a.run_at_ms b.run_at_ms in
            if by_due <> 0 then by_due else String.compare a.timer_id b.timer_id)
-    |> List.iter (fun timer ->
+    |> List.iter (fun (timer : timer) ->
            let fired = { timer with fired_at_ms = Some now_ms; updated_at_ms = now_ms } in
            Hashtbl.replace t.timers
              (timer_key ~workflow_id:timer.workflow_id ~timer_id:timer.timer_id)
@@ -785,9 +1057,10 @@ module Memory_backend = struct
                   finished_at_ms = Some now_ms;
                   message = Some message;
                   updated_at_ms = now_ms;
-                };
+              };
               append_event record ~workflow_id ~kind:Workflow_completed
-                ~worker_id ~message ~occurred_at_ms:now_ms t;
+                ~worker_id ~payload_json:(completion_payload ~status ~message)
+                ~message ~occurred_at_ms:now_ms t;
               Ok true
           | _ -> Ok false)
 
@@ -827,9 +1100,11 @@ module Memory_backend = struct
                   finished_at_ms = Some now_ms;
                   message = Some message;
                   updated_at_ms = now_ms;
-                };
+              };
               append_event record ~workflow_id ~kind:Workflow_completed
-                ~worker_id ~message ~occurred_at_ms:now_ms t;
+                ~worker_id
+                ~payload_json:(completion_payload ~status:Failed ~message)
+                ~message ~occurred_at_ms:now_ms t;
               Ok (Some (Retries_exhausted { attempt = item.attempt })))
             else
               let run_at_ms =
@@ -871,8 +1146,8 @@ module Memory_backend = struct
   let timers ~workflow_id t =
     with_lock t (fun () ->
         t.timers |> Hashtbl.to_seq_values |> List.of_seq
-        |> List.filter (fun timer -> String.equal timer.workflow_id workflow_id)
-        |> List.sort (fun a b ->
+        |> List.filter (fun (timer : timer) -> String.equal timer.workflow_id workflow_id)
+        |> List.sort (fun (a : timer) (b : timer) ->
                let by_due = Int64.compare a.run_at_ms b.run_at_ms in
                if by_due <> 0 then by_due else String.compare a.timer_id b.timer_id)
         |> Result.ok)
@@ -893,7 +1168,7 @@ module Memory_backend = struct
               | Activity_failed -> Activity_failed
             in
             append_event record ~workflow_id:result.workflow_id ~kind
-              ?payload_json:result.result_json ?message:result.error
+              ~payload_json:(activity_payload result) ?message:result.error
               ~occurred_at_ms:now_ms t;
             Ok ())
 

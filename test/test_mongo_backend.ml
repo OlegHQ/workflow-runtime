@@ -121,7 +121,15 @@ let test_mongo_claims_and_lease_recovery () =
       Alcotest.(check (list int))
         "sequence"
         [ 1; 2; 3; 4 ]
-        (List.map (fun event -> event.Workflow_runtime.sequence) history))
+        (List.map (fun event -> event.Workflow_runtime.sequence) history);
+      let replay =
+        Workflow_runtime.replay history
+        |> Result.fold ~ok:Fun.id ~error:(fun message -> Alcotest.fail message)
+      in
+      Alcotest.(check int) "replay claims" 2 replay.claim_count;
+      let completion = replay.Workflow_runtime.completion |> Option.get in
+      Alcotest.(check string) "replay completion" "succeeded"
+        (Workflow_runtime.status_to_string completion.status))
 
 let test_mongo_activity_results_survive_backend_instances () =
   Eio_main.run @@ fun env ->
@@ -200,7 +208,18 @@ let test_mongo_activity_results_survive_backend_instances () =
       Alcotest.(check string)
         "activity event" "activity_completed"
         (history |> List.rev |> List.hd |> fun event ->
-         Workflow_runtime.event_kind_to_string event.Workflow_runtime.kind))
+         Workflow_runtime.event_kind_to_string event.Workflow_runtime.kind);
+      let replay =
+        Workflow_runtime.replay history
+        |> Result.fold ~ok:Fun.id ~error:(fun message -> Alcotest.fail message)
+      in
+      Alcotest.(check int) "replay activity count" 1
+        (List.length replay.activities);
+      let activity = List.hd replay.activities in
+      Alcotest.(check string) "replay activity id" "publish_call"
+        activity.activity_id;
+      Alcotest.(check (option string)) "replay activity result"
+        (Some {|{"external_id":"123"}|}) activity.result_json)
 
 let test_mongo_kind_claim_filter_and_retry_policy () =
   Eio_main.run @@ fun env ->
@@ -354,6 +373,8 @@ let test_mongo_timer_survives_and_fires_across_backend_instances () =
       Workflow_runtime_mongo.ensure backend_a |> expect_ok "ensure";
       let capabilities = Workflow_runtime_mongo.capabilities backend_a in
       Alcotest.(check bool) "durable timers" true capabilities.durable_timers;
+      Alcotest.(check bool) "deterministic replay" true
+        capabilities.deterministic_replay;
       Workflow_runtime_mongo.enqueue backend_a ~now_ms:4_000L (workflow "wf_timer")
         (Workflow_runtime.enqueue_options ~run_at_ms:4_000L ())
       |> expect_ok "enqueue";
@@ -412,7 +433,17 @@ let test_mongo_timer_survives_and_fires_across_backend_instances () =
         (List.map
            (fun event ->
              Workflow_runtime.event_kind_to_string event.Workflow_runtime.kind)
-           history))
+           history);
+      let replay =
+        Workflow_runtime.replay history
+        |> Result.fold ~ok:Fun.id ~error:(fun message -> Alcotest.fail message)
+      in
+      Alcotest.(check int) "replay claims" 2 replay.claim_count;
+      Alcotest.(check int) "replay timer count" 1 (List.length replay.timers);
+      let timer = List.hd replay.timers in
+      Alcotest.(check string) "replay timer id" "sleep_1" timer.timer_id;
+      Alcotest.(check (option int64)) "replay fired" (Some 5_000L)
+        timer.fired_at_ms)
 
 let () =
   Mirage_crypto_rng_unix.use_default ();

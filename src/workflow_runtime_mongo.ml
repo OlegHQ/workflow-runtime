@@ -37,6 +37,7 @@ let capabilities _ =
       task_queue_filtering = true;
       retry_backoff = true;
       durable_timers = true;
+      deterministic_replay = true;
     }
 
 let mongo_error error = `Mongo (Mongo_error.to_string error)
@@ -372,6 +373,30 @@ let append_event t ~workflow_id ~sequence ~kind ?worker_id ?payload_json ?messag
 let timer_payload ~timer_id ~run_at_ms =
   Printf.sprintf {|{"timer_id":%S,"run_at_ms":%Ld}|} timer_id run_at_ms
 
+let string_option_json = function
+  | Some value -> `String value
+  | None -> `Null
+
+let completion_payload ~status ~message =
+  `Assoc
+    [
+      ("status", `String (Workflow_runtime.status_to_string status));
+      ("message", string_option_json (Some message));
+    ]
+  |> Yojson.Safe.to_string
+
+let activity_payload (result : Workflow_runtime.activity_result) =
+  `Assoc
+    [
+      ("activity_id", `String result.activity_id);
+      ("name", `String result.name);
+      ("attempt", `Int result.attempt);
+      ("status", `String (Workflow_runtime.activity_status_to_string result.status));
+      ("result_json", string_option_json result.result_json);
+      ("error", string_option_json result.error);
+    ]
+  |> Yojson.Safe.to_string
+
 let enqueue t ~now_ms workflow (options : Workflow_runtime.enqueue_options) =
   let item =
     Workflow_runtime.
@@ -648,6 +673,7 @@ let complete t ~workflow_id ~worker_id ~now_ms ~status ~message =
   | Ok (Some sequence) ->
       append_event t ~workflow_id ~sequence
         ~kind:Workflow_runtime.Workflow_completed ~worker_id ~message
+        ~payload_json:(completion_payload ~status ~message)
         ~occurred_at_ms:now_ms ()
       |> Result.map (fun () -> true)
 
@@ -888,7 +914,8 @@ let record_activity_result t ~now_ms (result : Workflow_runtime.activity_result)
     | Workflow_runtime.Activity_failed -> Workflow_runtime.Activity_failed
   in
   append_event t ~workflow_id:result.workflow_id ~sequence ~kind
-    ?payload_json:result.result_json ?message:result.error ~occurred_at_ms:now_ms ()
+    ~payload_json:(activity_payload result) ?message:result.error
+    ~occurred_at_ms:now_ms ()
 
 let find_activity_result t ~workflow_id ~activity_id =
   let id = activity_result_key ~workflow_id ~activity_id in

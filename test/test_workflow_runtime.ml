@@ -150,6 +150,22 @@ let test_history_targeted_claim_and_activity_result () =
     "event sequence"
     [ 1; 2; 3; 4 ]
     (List.map (fun event -> event.Workflow_runtime.sequence) history);
+  let replay =
+    Workflow_runtime.replay history
+    |> Result.fold ~ok:Fun.id ~error:(fun message -> Alcotest.fail message)
+  in
+  Alcotest.(check int) "replay claim count" 1 replay.claim_count;
+  Alcotest.(check int) "replay one activity" 1 (List.length replay.activities);
+  let replay_activity = List.hd replay.activities in
+  Alcotest.(check string) "replay activity id" "write_blog_file"
+    replay_activity.activity_id;
+  Alcotest.(check (option string)) "replay result" (Some {|{"sha":"abc"}|})
+    replay_activity.result_json;
+  let completion =
+    replay.Workflow_runtime.completion |> Option.get
+  in
+  Alcotest.(check string) "replay completion" "succeeded"
+    (Workflow_runtime.status_to_string completion.status);
   let result =
     Runtime.find_activity_result backend ~workflow_id:"wf_2"
       ~activity_id:"write_blog_file"
@@ -178,6 +194,8 @@ let test_kind_claim_filter_and_retry_policy () =
   let capabilities = Runtime.capabilities backend in
   Alcotest.(check bool) "task queue filtering" true
     capabilities.task_queue_filtering;
+  Alcotest.(check bool) "deterministic replay" true
+    capabilities.deterministic_replay;
   let claim =
     Runtime.claim_next backend ~kind:"send_email" ~worker_id:"email-worker"
       ~lease_ms:10_000L
@@ -292,7 +310,18 @@ let test_durable_timer_schedules_and_fires () =
     ]
     (List.map
        (fun event -> Workflow_runtime.event_kind_to_string event.Workflow_runtime.kind)
-       history)
+       history);
+  let replay =
+    Workflow_runtime.replay history
+    |> Result.fold ~ok:Fun.id ~error:(fun message -> Alcotest.fail message)
+  in
+  Alcotest.(check int) "replay claims" 2 replay.claim_count;
+  Alcotest.(check int) "replay one timer" 1 (List.length replay.timers);
+  let timer = List.hd replay.timers in
+  Alcotest.(check string) "replay timer id" "sleep_1" timer.timer_id;
+  Alcotest.(check int64) "replay timer due" 7_000L timer.run_at_ms;
+  Alcotest.(check (option int64)) "replay timer fired" (Some 7_000L)
+    timer.fired_at_ms
 
 let test_grouping_filtering_and_reschedule () =
   let now = ref 10L in

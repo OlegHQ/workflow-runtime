@@ -55,6 +55,7 @@ type backend_capabilities = {
   task_queue_filtering : bool;
   retry_backoff : bool;
   durable_timers : bool;
+  deterministic_replay : bool;
 }
 
 type event_kind =
@@ -115,6 +116,38 @@ type retry_decision =
   | Retried of { attempt : int; run_at_ms : int64 }
   | Retries_exhausted of { attempt : int }
 
+type replay_completion = {
+  status : status;
+  message : string option;
+  completed_at_ms : int64;
+}
+
+type replay_timer = {
+  timer_id : string;
+  run_at_ms : int64;
+  scheduled_at_ms : int64;
+  fired_at_ms : int64 option;
+}
+
+type replay_activity = {
+  activity_id : string;
+  name : string;
+  attempt : int;
+  status : activity_status;
+  result_json : string option;
+  error : string option;
+  completed_at_ms : int64;
+}
+
+type replay_state = {
+  workflow_id : string option;
+  enqueued_at_ms : int64 option;
+  claim_count : int;
+  completion : replay_completion option;
+  timers : replay_timer list;
+  activities : replay_activity list;
+}
+
 val enqueue_options :
   ?run_at_ms:int64 -> ?payload_json:string -> unit -> enqueue_options
 
@@ -136,9 +169,11 @@ val item_to_yojson : item -> Yojson.Safe.t
 val event_to_yojson : event -> Yojson.Safe.t
 val activity_result_to_yojson : activity_result -> Yojson.Safe.t
 val timer_to_yojson : timer -> Yojson.Safe.t
+val replay_state_to_yojson : replay_state -> Yojson.Safe.t
 val items_to_yojson : ?group_by_tenant:bool -> item list -> Yojson.Safe.t
 val stats : item list -> stats
 val retry_delay_ms : retry_policy -> attempt:int -> int64
+val replay : event list -> (replay_state, string) result
 
 module type BACKEND = sig
   type t
