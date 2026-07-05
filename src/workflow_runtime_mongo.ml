@@ -457,6 +457,21 @@ let ensure t =
   let* () =
     Mongo_eio.direct_ensure_index t.client ~db:t.db
       ~collection:t.workflows_collection
+      (index_key [ int32 "status" 1; int32 "lease_expires_at_ms" 1 ])
+      [ Mongo_index.Name "workflow_expired_lease_idx" ]
+    |> Result.map_error mongo_error
+  in
+  let* () =
+    Mongo_eio.direct_ensure_index t.client ~db:t.db
+      ~collection:t.workflows_collection
+      (index_key
+         [ int32 "status" 1; int32 "kind" 1; int32 "lease_expires_at_ms" 1 ])
+      [ Mongo_index.Name "workflow_kind_expired_lease_idx" ]
+    |> Result.map_error mongo_error
+  in
+  let* () =
+    Mongo_eio.direct_ensure_index t.client ~db:t.db
+      ~collection:t.workflows_collection
       (index_key [ int32 "tenant_id" 1; int32 "updated_at_ms" (-1) ])
       [ Mongo_index.Name "workflow_tenant_updated_idx" ]
     |> Result.map_error mongo_error

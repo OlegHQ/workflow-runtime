@@ -38,6 +38,19 @@ let bson_int64 name value = (name, Bson.create_int64 value)
 
 let bson_doc_element name value = (name, Bson.create_doc_element value)
 
+let cursor_batch name doc =
+  let cursor = Bson.get_doc_element (Bson.get_element "cursor" doc) in
+  Bson.get_list (Bson.get_element name cursor) |> List.map Bson.get_doc_element
+
+let index_names client ~db ~collection =
+  Mongo_eio.direct_run_command client db
+    [ ("listIndexes", Bson.create_string collection) ]
+  |> Result.map_error (fun error -> `Mongo (Mongo_error.to_string error))
+  |> expect_ok "list indexes"
+  |> fun (response : Mongo_command.response) ->
+  cursor_batch "firstBatch" response.body
+  |> List.map (fun index -> Bson.get_string (Bson.get_element "name" index))
+
 let test_mongo_claims_and_lease_recovery () =
   Eio_main.run @@ fun env ->
   Eio.Switch.run @@ fun sw ->
@@ -76,6 +89,18 @@ let test_mongo_claims_and_lease_recovery () =
         Workflow_runtime_mongo.create ~client ~db ~collection ()
       in
       Workflow_runtime_mongo.ensure backend_a |> expect_ok "ensure";
+      let indexes = index_names client ~db ~collection in
+      Alcotest.(check bool)
+        "due claim index" true (List.mem "workflow_due_idx" indexes);
+      Alcotest.(check bool)
+        "kind due claim index" true
+        (List.mem "workflow_kind_due_idx" indexes);
+      Alcotest.(check bool)
+        "expired lease claim index" true
+        (List.mem "workflow_expired_lease_idx" indexes);
+      Alcotest.(check bool)
+        "kind expired lease claim index" true
+        (List.mem "workflow_kind_expired_lease_idx" indexes);
       Workflow_runtime_mongo.enqueue backend_a ~now_ms:1_000L (workflow "wf_1")
         (Workflow_runtime.enqueue_options ~run_at_ms:1_000L ())
       |> expect_ok "enqueue wf_1";
