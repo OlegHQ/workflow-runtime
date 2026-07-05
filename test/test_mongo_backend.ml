@@ -1122,12 +1122,38 @@ let test_mongo_updates_survive_backend_instances () =
       in
       Alcotest.(check int) "replay update count" 2
         (List.length state.updates);
+      let completed_event_filter =
+        bson_doc
+          [
+            bson_string "workflow_id" "wf_update";
+            bson_string "kind" "update_completed";
+          ]
+      in
+      Mongo_eio.direct_delete_many client ~db
+        ~collection:"update_workflows_events" completed_event_filter
+      |> Result.map_error (fun error -> `Mongo (Mongo_error.to_string error))
+      |> expect_ok "delete update completed events"
+      |> ignore;
       Workflow_runtime_mongo.complete_update backend_a ~workflow_id:"wf_update"
         ~worker_id:"worker_a" ~now_ms:9_007L ~update_id:"upd_accept"
         ~status:Workflow_runtime.Update_completed_status
         ~result_json:{|{"accepted":true}|} ()
       |> expect_ok "duplicate complete update"
-      |> Alcotest.(check bool) "duplicate completion idempotent" true)
+      |> Alcotest.(check bool) "duplicate completion idempotent" true;
+      let repaired_state =
+        Workflow_runtime_mongo.query_state ~workflow_id:"wf_update" backend_b
+        |> expect_ok "repaired query state"
+        |> Option.get
+      in
+      Alcotest.(check int) "repaired replay update count" 2
+        (List.length repaired_state.updates);
+      let repaired_accepted =
+        repaired_state.updates
+        |> List.find (fun update ->
+               String.equal update.Workflow_runtime.update_id "upd_accept")
+      in
+      Alcotest.(check string) "repaired accepted status" "completed"
+        (Workflow_runtime.update_status_to_string repaired_accepted.status))
 
 let () =
   Mirage_crypto_rng_unix.use_default ();

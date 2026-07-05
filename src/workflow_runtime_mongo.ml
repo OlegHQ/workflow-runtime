@@ -1332,6 +1332,29 @@ let ensure_update_requested_event t ~workflow_id ~now_ms
           ~message:update.name ~occurred_at_ms:now_ms ()
         |> Result.map (fun () -> true)
 
+let ensure_update_completed_event t ~workflow_id ~worker_id ~now_ms
+    (update : Workflow_runtime.workflow_update) =
+  let payload_json = update_payload update in
+  let ( let* ) = Result.bind in
+  let* exists =
+    event_exists t ~workflow_id ~kind:Workflow_runtime.Update_completed
+      ~payload_json
+  in
+  if exists then Ok true
+  else
+    let workflow_update =
+      doc [ doc_element "$inc" (doc [ int32 "event_sequence" 1 ]) ]
+    in
+    update_owned t ~workflow_id ~worker_id ~now_ms workflow_update
+    |> function
+    | Error _ as error -> error
+    | Ok None -> Ok false
+    | Ok (Some sequence) ->
+        append_event t ~workflow_id ~sequence
+          ~kind:Workflow_runtime.Update_completed ~worker_id ~payload_json
+          ?message:update.error ~occurred_at_ms:now_ms ()
+        |> Result.map (fun () -> true)
+
 let signal t ~workflow_id ~now_ms ~signal_id ~name ?payload_json () =
   let ( let* ) = Result.bind in
   let* workflow_exists =
@@ -1609,7 +1632,8 @@ let complete_update t ~workflow_id ~worker_id ~now_ms ~update_id ~status
         match current with
         | None -> Ok false
         | Some existing when existing.Workflow_runtime.status <> Update_pending ->
-            Ok true
+            ensure_update_completed_event t ~workflow_id ~worker_id ~now_ms
+              existing
         | Some existing ->
             let completed =
               Workflow_runtime.
@@ -1633,19 +1657,8 @@ let complete_update t ~workflow_id ~worker_id ~now_ms ~update_id ~status
                    ])
               |> Result.map_error mongo_error
             in
-            let workflow_update =
-              doc [ doc_element "$inc" (doc [ int32 "event_sequence" 1 ]) ]
-            in
-            update_owned t ~workflow_id ~worker_id ~now_ms workflow_update
-            |> function
-            | Error _ as error -> error
-            | Ok None -> Ok false
-            | Ok (Some sequence) ->
-                append_event t ~workflow_id ~sequence
-                  ~kind:Workflow_runtime.Update_completed ~worker_id
-                  ~payload_json:(update_payload completed) ?message:error
-                  ~occurred_at_ms:now_ms ()
-                |> Result.map (fun () -> true)
+            ensure_update_completed_event t ~workflow_id ~worker_id ~now_ms
+              completed
 
 let record_activity_result t ~now_ms (result : Workflow_runtime.activity_result) =
   let result = { result with Workflow_runtime.updated_at_ms = now_ms } in
