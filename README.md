@@ -1,31 +1,48 @@
 # workflow-runtime
 
-`workflow-runtime` is a small OCaml library for observing in-process workflow
-execution. It tracks lifecycle state by durable workflow id, tenant, kind,
-subject, and metadata, then exposes structured, flat JSON, and tenant-grouped
-JSON snapshots.
+`workflow-runtime` is an OCaml library for backend-backed workflow execution and
+observation. It tracks lifecycle state by durable workflow id, tenant, kind,
+subject, and metadata, exposes structured snapshots, and provides an atomic
+claim/lease API for multi-worker execution.
 
-It is deliberately not a durable Temporal replacement. Keep the source of truth
-in a database, queue, or log, and use this runtime as the single-process
-execution/observability layer around those durable records.
+The API is backend-functorized. The core runtime is storage-agnostic; the
+`workflow-runtime.mongo` library supplies a MongoDB backend using `findAndModify`
+for atomic multi-instance claims.
 
 ## Guarantees
 
-- Thread-safe lifecycle updates.
-- Bounded retention through `max_items`.
-- Oldest terminal workflows are evicted first.
-- Active `queued` and `running` workflows are kept visible.
+- Atomic worker claims with expiring leases.
+- Worker heartbeats to extend active leases.
+- Lease expiry recovery after worker/process crashes.
+- Terminal completion as `succeeded`, `blocked`, or `failed`.
+- Durable reschedule back to `queued`.
 - Tenant-filtered and tenant-grouped snapshots.
-- No dependency on Eio, Dream, Mongo, or any application domain types.
+- Core runtime has no dependency on Eio, Dream, Mongo, or application domain
+  types.
+- Mongo backend uses BSON DTOs generated with `bson.ppx`.
+
+## Temporal Comparison
+
+Temporal is more than a distributed status table. Its reliability comes from a
+durable Event History, task queues, workflow replay, activity result
+preservation, durable timers, retries, timeouts, and worker polling. This
+library currently implements the lower-level distributed execution foundation:
+durable state, atomic claims, leases, heartbeats, recovery, and visibility.
+
+Before calling this Temporal-like for complex business workflows, add:
+
+- append-only workflow event history;
+- deterministic workflow replay over event history;
+- activity scheduling with recorded activity results;
+- retry policies and backoff;
+- durable timers;
+- signal/query APIs;
+- task queues separated by workflow/activity kind;
+- history compaction or continue-as-new style rollover.
 
 ## Minimal Example
 
 ```ocaml
-let runtime =
-  Workflow_runtime.create
-    ~clock:(fun () -> Int64.of_float (Unix.gettimeofday () *. 1000.))
-    ()
-
 let workflow =
   Workflow_runtime.
     {
@@ -37,10 +54,23 @@ let workflow =
       metadata = [ ("destination", "personal_blog") ];
     }
 
+module Runtime =
+  Workflow_runtime.Make
+    (struct
+      let now_ms () = Int64.of_float (Unix.gettimeofday () *. 1000.)
+    end)
+    (Workflow_runtime.Memory_backend)
+
+let backend = Workflow_runtime.Memory_backend.create ()
+
 let () =
-  Workflow_runtime.record_queued runtime workflow;
-  Workflow_runtime.record_running runtime workflow;
-  Workflow_runtime.record_succeeded runtime workflow "published"
+  Runtime.enqueue backend workflow (Workflow_runtime.enqueue_options ()) |> ignore;
+  match Runtime.claim_next backend ~worker_id:"worker-1" ~lease_ms:30_000L with
+  | Ok (Some claim) ->
+      Runtime.complete backend ~workflow_id:claim.item.workflow.id
+        ~worker_id:"worker-1" ~status:Succeeded ~message:"published"
+      |> ignore
+  | Ok None | Error _ -> ()
 ```
 
 ## Development

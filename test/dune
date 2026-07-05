@@ -1,3 +1,13 @@
 (test
  (name test_workflow_runtime)
  (libraries workflow_runtime alcotest))
+
+(test
+ (name test_mongo_backend)
+ (libraries
+  workflow_runtime
+  workflow_runtime_mongo
+  mongo
+  eio_main
+  mirage-crypto-rng.unix
+  alcotest))

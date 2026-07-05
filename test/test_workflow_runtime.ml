@@ -19,72 +19,145 @@ let clock_from values =
     | [] -> Alcotest.fail "clock exhausted"
 
 let status_of_single json =
-  match json with
-  | `Assoc fields -> (
-      match List.assoc_opt "workflows" fields with
-      | Some (`List [ item ]) ->
-          Yojson.Safe.Util.(item |> member "status" |> to_string)
-      | _ -> "")
+  match Yojson.Safe.Util.(json |> member "workflows" |> to_list) with
+  | [ item ] -> Yojson.Safe.Util.(item |> member "status" |> to_string)
   | _ -> ""
 
+let expect_ok label = function
+  | Ok value -> value
+  | Error error -> Alcotest.fail (label ^ ": " ^ Workflow_runtime.Memory_backend.error_to_string error)
+
 let test_lifecycle_and_stats () =
-  let runtime =
-    Workflow_runtime.create
-      ~clock:(clock_from [ 1_000L; 1_001L; 1_002L; 1_003L ])
-      ()
+  let module Runtime =
+    Workflow_runtime.Make (struct
+      let now_ms = clock_from [ 1_000L; 1_001L; 1_002L; 1_003L ]
+    end) (Workflow_runtime.Memory_backend)
   in
+  let backend = Workflow_runtime.Memory_backend.create () in
   let workflow = workflow "wf_1" in
-  Workflow_runtime.record_queued runtime workflow;
-  Workflow_runtime.record_running runtime workflow;
-  Workflow_runtime.record_blocked runtime workflow "missing connection";
-  let snapshot = Workflow_runtime.snapshot runtime in
+  Runtime.ensure backend |> expect_ok "ensure";
+  Runtime.enqueue backend workflow (Workflow_runtime.enqueue_options ()) |> expect_ok "enqueue";
+  let claim =
+    Runtime.claim_next backend ~worker_id:"worker_a" ~lease_ms:30_000L
+    |> expect_ok "claim"
+    |> Option.get
+  in
+  Alcotest.(check string) "claimed id" "wf_1" claim.item.workflow.id;
+  Runtime.complete backend ~workflow_id:"wf_1" ~worker_id:"worker_a"
+    ~status:Blocked ~message:"missing connection"
+  |> expect_ok "complete"
+  |> Alcotest.(check bool) "completed" true;
+  let snapshot = Runtime.snapshot backend |> expect_ok "snapshot" in
   Alcotest.(check int) "one workflow" 1 (List.length snapshot);
   Alcotest.(check string)
     "blocked JSON" "blocked"
-    (Workflow_runtime.snapshot_json runtime |> status_of_single);
-  Alcotest.(check int) "blocked stat" 1 (Workflow_runtime.stats runtime).blocked
+    (Runtime.snapshot_json backend |> expect_ok "snapshot_json" |> status_of_single);
+  Alcotest.(check int) "blocked stat" 1 (Workflow_runtime.stats snapshot).blocked
 
-let test_grouping_filtering_and_eviction () =
-  let runtime =
-    Workflow_runtime.create
-      ~clock:(clock_from [ 10L; 11L; 12L; 13L; 14L; 15L; 16L ])
-      ~max_items:2 ()
+let test_multi_worker_claims_are_exclusive_and_expire () =
+  let now = ref 10_000L in
+  let module Runtime =
+    Workflow_runtime.Make (struct
+      let now_ms () = !now
+    end) (Workflow_runtime.Memory_backend)
   in
-  let first = workflow "wf_1" in
-  let second = workflow ~tenant_id:"tenant_b" "wf_2" in
-  let third = workflow ~tenant_id:"tenant_b" "wf_3" in
-  Workflow_runtime.record_queued runtime first;
-  Workflow_runtime.record_succeeded runtime first "done";
-  Workflow_runtime.record_running runtime second;
-  Workflow_runtime.record_queued runtime third;
-  let groups = Workflow_runtime.grouped_by_tenant runtime in
+  let backend = Workflow_runtime.Memory_backend.create () in
+  Runtime.enqueue backend (workflow "wf_1") (Workflow_runtime.enqueue_options ())
+  |> expect_ok "enqueue 1";
+  Runtime.enqueue backend (workflow "wf_2") (Workflow_runtime.enqueue_options ())
+  |> expect_ok "enqueue 2";
+  let first =
+    Runtime.claim_next backend ~worker_id:"worker_a" ~lease_ms:100L
+    |> expect_ok "claim a"
+    |> Option.get
+  in
+  let second =
+    Runtime.claim_next backend ~worker_id:"worker_b" ~lease_ms:100L
+    |> expect_ok "claim b"
+    |> Option.get
+  in
   Alcotest.(check bool)
-    "oldest terminal evicted" false
-    (List.mem_assoc "tenant_a" groups);
+    "different claims" true
+    (not (String.equal first.item.workflow.id second.item.workflow.id));
+  Alcotest.(check (option string))
+    "nothing left" None
+    (Runtime.claim_next backend ~worker_id:"worker_c" ~lease_ms:100L
+     |> expect_ok "claim c"
+     |> Option.map (fun (claim : Workflow_runtime.claim) ->
+            claim.item.workflow.id));
+  now := 10_101L;
+  let recovered =
+    Runtime.claim_next backend ~worker_id:"worker_c" ~lease_ms:100L
+    |> expect_ok "claim expired"
+    |> Option.get
+  in
+  Alcotest.(check int) "attempt incremented" 2 recovered.item.attempt
+
+let test_grouping_filtering_and_reschedule () =
+  let now = ref 10L in
+  let module Runtime =
+    Workflow_runtime.Make (struct
+      let now_ms () =
+        let value = !now in
+        now := Int64.add value 1L;
+        value
+    end) (Workflow_runtime.Memory_backend)
+  in
+  let backend = Workflow_runtime.Memory_backend.create () in
+  Runtime.enqueue backend (workflow "wf_1") (Workflow_runtime.enqueue_options ())
+  |> expect_ok "enqueue a";
+  Runtime.enqueue backend
+    (workflow ~tenant_id:"tenant_b" "wf_2")
+    (Workflow_runtime.enqueue_options ())
+  |> expect_ok "enqueue b";
+  let claim =
+    Runtime.claim_next backend ~worker_id:"worker_a" ~lease_ms:100L
+    |> expect_ok "claim"
+    |> Option.get
+  in
+  Runtime.reschedule backend ~workflow_id:claim.item.workflow.id
+    ~worker_id:"worker_a" ~run_at_ms:1_000L ~message:"wait"
+  |> expect_ok "reschedule"
+  |> Alcotest.(check bool) "rescheduled" true;
+  let grouped =
+    Runtime.snapshot_json backend ~group_by_tenant:true
+    |> expect_ok "grouped snapshot"
+  in
+  let tenants =
+    match Yojson.Safe.Util.(grouped |> member "tenants") with
+    | `Assoc tenants -> tenants
+    | _ -> Alcotest.fail "unexpected grouped workflow JSON"
+  in
+  Alcotest.(check bool) "tenant a present" true (List.mem_assoc "tenant_a" tenants);
   Alcotest.(check int)
-    "tenant b retained" 2
-    (match List.assoc_opt "tenant_b" groups with
-    | Some items -> List.length items
-    | None -> 0);
-  Alcotest.(check int)
-    "tenant filter" 2
-    (Workflow_runtime.snapshot ~tenant_id:"tenant_b" runtime |> List.length)
+    "tenant filter" 1
+    (Runtime.snapshot backend ~tenant_id:"tenant_b" |> expect_ok "tenant snapshot" |> List.length)
 
 let test_validation () =
-  let runtime = Workflow_runtime.create ~clock:(fun () -> 1L) () in
-  Alcotest.check_raises "empty id rejected"
-    (Invalid_argument "Workflow_runtime: workflow id must not be empty")
-    (fun () ->
-      Workflow_runtime.record_queued runtime
-        (Workflow_runtime.
-           {
-             id = "";
-             tenant_id = "tenant";
-             kind = "kind";
-             subject_id = None;
-             name = None;
-             metadata = [];
-           }))
+  let module Runtime =
+    Workflow_runtime.Make (struct
+      let now_ms () = 1L
+    end) (Workflow_runtime.Memory_backend)
+  in
+  let backend = Workflow_runtime.Memory_backend.create () in
+  match
+    Runtime.enqueue backend
+      Workflow_runtime.
+        {
+          id = "";
+          tenant_id = "tenant";
+          kind = "kind";
+          subject_id = None;
+          name = None;
+          metadata = [];
+        }
+      (Workflow_runtime.enqueue_options ())
+  with
+  | Error (`Invalid_workflow _) -> ()
+  | Ok () -> Alcotest.fail "expected validation error"
+  | Error error ->
+      Alcotest.fail
+        ("unexpected error: " ^ Workflow_runtime.Memory_backend.error_to_string error)
 
 let () =
   Alcotest.run "workflow-runtime"
@@ -92,8 +165,10 @@ let () =
       ( "runtime",
         [
           Alcotest.test_case "lifecycle and stats" `Quick test_lifecycle_and_stats;
-          Alcotest.test_case "grouping filtering and eviction" `Quick
-            test_grouping_filtering_and_eviction;
+          Alcotest.test_case "multi-worker exclusive claims" `Quick
+            test_multi_worker_claims_are_exclusive_and_expire;
+          Alcotest.test_case "grouping filtering and reschedule" `Quick
+            test_grouping_filtering_and_reschedule;
           Alcotest.test_case "validation" `Quick test_validation;
         ] );
     ]

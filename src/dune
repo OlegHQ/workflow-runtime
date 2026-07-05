@@ -1,4 +1,13 @@
 (library
  (name workflow_runtime)
  (public_name workflow-runtime)
+ (modules workflow_runtime)
  (libraries yojson threads))
+
+(library
+ (name workflow_runtime_mongo)
+ (public_name workflow-runtime.mongo)
+ (modules workflow_runtime_mongo)
+ (libraries workflow_runtime mongo bson)
+ (preprocess
+  (pps bson.ppx)))

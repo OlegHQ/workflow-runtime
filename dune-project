@@ -17,4 +17,9 @@
   (dune (>= 3.22))
   yojson
   base-threads
+  bson
+  mongo
+  eio
+  eio_main
+  mirage-crypto-rng
   (alcotest :with-test)))
