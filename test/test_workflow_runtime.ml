@@ -128,6 +128,19 @@ let test_history_targeted_claim_and_activity_result () =
         updated_at_ms = 0L;
       }
   |> expect_ok "record activity";
+  Runtime.record_activity_result backend
+    Workflow_runtime.
+      {
+        activity_id = "write_blog_file";
+        workflow_id = "wf_2";
+        name = "write blog file";
+        attempt = 1;
+        status = Activity_succeeded;
+        result_json = Some {|{"sha":"abc"}|};
+        error = None;
+        updated_at_ms = 0L;
+      }
+  |> expect_ok "record duplicate activity";
   Runtime.complete backend ~workflow_id:"wf_2" ~worker_id:"worker_a"
     ~status:Succeeded ~message:"done"
   |> expect_ok "complete wf_2"

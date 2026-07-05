@@ -1987,11 +1987,14 @@ module Memory_backend = struct
         match Hashtbl.find_opt t.records result.workflow_id with
         | None -> Error (`Invalid_workflow ("unknown workflow: " ^ result.workflow_id))
         | Some record ->
+            let key =
+              activity_key ~workflow_id:result.workflow_id
+                ~activity_id:result.activity_id
+            in
+            if Hashtbl.mem t.activity_results key then Ok ()
+            else
             let result = { result with updated_at_ms = now_ms } in
-            Hashtbl.replace t.activity_results
-              (activity_key ~workflow_id:result.workflow_id
-                 ~activity_id:result.activity_id)
-              result;
+            Hashtbl.replace t.activity_results key result;
             let kind =
               match result.status with
               | Activity_succeeded -> Activity_completed

@@ -331,6 +331,31 @@ let test_mongo_activity_results_survive_backend_instances () =
             updated_at_ms = 0L;
           }
       |> expect_ok "record activity";
+      let activity_event_filter =
+        bson_doc
+          [
+            bson_string "workflow_id" "wf_activity";
+            bson_string "kind" "activity_completed";
+          ]
+      in
+      Mongo_eio.direct_delete_many client ~db
+        ~collection:"activity_workflows_events" activity_event_filter
+      |> Result.map_error (fun error -> `Mongo (Mongo_error.to_string error))
+      |> expect_ok "delete activity events"
+      |> ignore;
+      Workflow_runtime_mongo.record_activity_result backend_b ~now_ms:2_003L
+        Workflow_runtime.
+          {
+            activity_id = "publish_call";
+            workflow_id = "wf_activity";
+            name = "Publish call";
+            attempt = 1;
+            status = Activity_succeeded;
+            result_json = Some {|{"external_id":"456"}|};
+            error = None;
+            updated_at_ms = 0L;
+          }
+      |> expect_ok "record duplicate activity";
       let found =
         Workflow_runtime_mongo.find_activity_result backend_b
           ~workflow_id:"wf_activity" ~activity_id:"publish_call"

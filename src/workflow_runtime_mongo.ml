@@ -1355,6 +1355,27 @@ let ensure_update_completed_event t ~workflow_id ~worker_id ~now_ms
           ?message:update.error ~occurred_at_ms:now_ms ()
         |> Result.map (fun () -> true)
 
+let ensure_activity_result_event t ~now_ms
+    (result : Workflow_runtime.activity_result) =
+  let kind =
+    match result.status with
+    | Workflow_runtime.Activity_succeeded -> Workflow_runtime.Activity_completed
+    | Workflow_runtime.Activity_failed -> Workflow_runtime.Activity_failed
+  in
+  let payload_json = activity_payload result in
+  let ( let* ) = Result.bind in
+  let* exists = event_exists t ~workflow_id:result.workflow_id ~kind ~payload_json in
+  if exists then Ok ()
+  else
+    let* sequence =
+      match increment_event_sequence t ~workflow_id:result.workflow_id with
+      | Error _ as error -> error
+      | Ok (Some sequence) -> Ok sequence
+      | Ok None -> Error (`Bad_document ("unknown workflow: " ^ result.workflow_id))
+    in
+    append_event t ~workflow_id:result.workflow_id ~sequence ~kind
+      ~payload_json ?message:result.error ~occurred_at_ms:now_ms ()
+
 let signal t ~workflow_id ~now_ms ~signal_id ~name ?payload_json () =
   let ( let* ) = Result.bind in
   let* workflow_exists =
@@ -1664,29 +1685,26 @@ let record_activity_result t ~now_ms (result : Workflow_runtime.activity_result)
   let result = { result with Workflow_runtime.updated_at_ms = now_ms } in
   let result_doc = activity_result_doc_of_result result in
   let update =
-    doc [ doc_element "$set" (activity_result_doc_to_bson_doc result_doc) ]
+    doc [ doc_element "$setOnInsert" (activity_result_doc_to_bson_doc result_doc) ]
   in
   let filter = doc [ string "_id" result_doc.id ] in
   let ( let* ) = Result.bind in
-  let* _ =
+  let* write =
     Mongo_eio.direct_update_one t.client ~db:t.db
       ~collection:t.activity_results_collection ~upsert:true filter update
     |> Result.map_error mongo_error
   in
-  let* sequence =
-    match increment_event_sequence t ~workflow_id:result.workflow_id with
+  if write.Mongo_crud.upserted_ids = [] then
+    Mongo_eio.direct_find_one t.client ~db:t.db
+      ~collection:t.activity_results_collection filter
+    |> Result.map_error mongo_error
+    |> function
     | Error _ as error -> error
-    | Ok (Some sequence) -> Ok sequence
-    | Ok None -> Error (`Bad_document ("unknown workflow: " ^ result.workflow_id))
-  in
-  let kind =
-    match result.status with
-    | Workflow_runtime.Activity_succeeded -> Workflow_runtime.Activity_completed
-    | Workflow_runtime.Activity_failed -> Workflow_runtime.Activity_failed
-  in
-  append_event t ~workflow_id:result.workflow_id ~sequence ~kind
-    ~payload_json:(activity_payload result) ?message:result.error
-    ~occurred_at_ms:now_ms ()
+    | Ok None -> Error (`Bad_document ("missing activity result: " ^ result_doc.id))
+    | Ok (Some bson) ->
+        let* result = decode_activity_result bson in
+        ensure_activity_result_event t ~now_ms result
+  else ensure_activity_result_event t ~now_ms result
 
 let find_activity_result t ~workflow_id ~activity_id =
   let id = activity_result_key ~workflow_id ~activity_id in

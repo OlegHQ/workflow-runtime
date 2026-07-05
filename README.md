@@ -25,6 +25,9 @@ reusable Eio worker runner over the same functorized runtime API.
 - Append-only ordered workflow event history for audit and replay inputs.
 - Activity result recording and lookup so retried workflow code can preserve
   completed side effects.
+- Activity result recording is idempotent by workflow/activity id and repairs a
+  missing activity history event from the durable result record on duplicate
+  delivery.
 - Kind-filtered claims for task-queue style workers.
 - Retry policy support with bounded exponential backoff and terminal exhaustion.
 - Durable timers that release the worker lease, persist wake-up metadata, and
