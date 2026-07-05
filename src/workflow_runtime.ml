@@ -1560,16 +1560,17 @@ module Memory_backend = struct
             Ok (Some { item = claimed; worker_id; lease_expires_at_ms })
         | _ -> Ok None)
 
-  let owned_by item worker_id =
-    match item.lease_owner with
-    | Some owner -> String.equal owner worker_id
-    | None -> false
+  let active_owned_by ~now_ms (item : item) worker_id =
+    match (item.status, item.lease_owner, item.lease_expires_at_ms) with
+    | Running, Some owner, Some lease_expires_at_ms ->
+        String.equal owner worker_id && lease_expires_at_ms > now_ms
+    | _ -> false
 
   let schedule_timer t ~workflow_id ~worker_id ~now_ms ~timer_id ~run_at_ms
       ?payload_json ~message () =
     with_lock t (fun () ->
         match Hashtbl.find_opt t.records workflow_id with
-        | Some record when owned_by record.item worker_id ->
+        | Some record when active_owned_by ~now_ms record.item worker_id ->
             let item = record.item in
             let timer =
               {
@@ -1603,7 +1604,7 @@ module Memory_backend = struct
   let heartbeat t ~workflow_id ~worker_id ~now_ms ~lease_ms =
     with_lock t (fun () ->
         match Hashtbl.find_opt t.records workflow_id with
-        | Some record when owned_by record.item worker_id ->
+        | Some record when active_owned_by ~now_ms record.item worker_id ->
             let item = record.item in
             let next =
               {
@@ -1628,7 +1629,7 @@ module Memory_backend = struct
     else
       with_lock t (fun () ->
           match Hashtbl.find_opt t.records workflow_id with
-          | Some record when owned_by record.item worker_id ->
+          | Some record when active_owned_by ~now_ms record.item worker_id ->
               let item = record.item in
               record.item <-
                 {
@@ -1649,7 +1650,7 @@ module Memory_backend = struct
   let reschedule t ~workflow_id ~worker_id ~now_ms ~run_at_ms ~message =
     with_lock t (fun () ->
         match Hashtbl.find_opt t.records workflow_id with
-        | Some record when owned_by record.item worker_id ->
+        | Some record when active_owned_by ~now_ms record.item worker_id ->
             let item = record.item in
             record.item <-
               {
@@ -1670,7 +1671,7 @@ module Memory_backend = struct
   let retry t ~workflow_id ~worker_id ~now_ms ~policy ~message =
     with_lock t (fun () ->
         match Hashtbl.find_opt t.records workflow_id with
-        | Some record when owned_by record.item worker_id ->
+        | Some record when active_owned_by ~now_ms record.item worker_id ->
             let item = record.item in
             if item.attempt >= policy.max_attempts then (
               record.item <-
@@ -1864,7 +1865,9 @@ module Memory_backend = struct
             match Hashtbl.find_opt t.records parent_workflow_id with
             | None -> Error (`Invalid_workflow ("unknown parent workflow: " ^ parent_workflow_id))
             | Some parent when terminal_status parent.item.status -> Ok false
-            | Some parent when not (owned_by parent.item worker_id) -> Ok false
+            | Some parent
+              when not (active_owned_by ~now_ms parent.item worker_id) ->
+                Ok false
             | Some parent ->
                 let key =
                   child_key ~parent_workflow_id
@@ -1957,7 +1960,7 @@ module Memory_backend = struct
     | Update_completed_status | Update_rejected | Update_failed ->
         with_lock t (fun () ->
             match Hashtbl.find_opt t.records workflow_id with
-            | Some record when owned_by record.item worker_id -> (
+            | Some record when active_owned_by ~now_ms record.item worker_id -> (
                 let key = update_key ~workflow_id ~update_id in
                 match Hashtbl.find_opt t.updates key with
                 | None -> Ok false

@@ -131,6 +131,137 @@ let test_mongo_claims_and_lease_recovery () =
       Alcotest.(check string) "replay completion" "succeeded"
         (Workflow_runtime.status_to_string completion.status))
 
+let test_mongo_owned_operations_require_active_lease () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let config =
+    Mongo_config.
+      {
+        (default ~host ~port ~database:db ()) with
+        direct_connection = true;
+        server_selection_timeout_ms = 2_000;
+        connect_timeout_ms = 2_000;
+        socket_timeout_ms = Some 5_000;
+        app_name = Some "workflow-runtime-e2e";
+      }
+  in
+  let client =
+    match
+      Mongo_eio.connect ~sw ~net:(Eio.Stdenv.net env)
+        ~clock:(Eio.Stdenv.clock env) ~config
+    with
+    | Ok client -> client
+    | Error error ->
+        Alcotest.fail ("connect: " ^ Mongo_error.to_string error)
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      let _ =
+        Mongo_eio.direct_run_command client db
+          [ ("dropDatabase", Bson.create_int32 1l) ]
+      in
+      Mongo_eio.close_direct client)
+    (fun () ->
+      let backend_a =
+        Workflow_runtime_mongo.create ~client ~db ~collection:"lease_workflows" ()
+      in
+      let backend_b =
+        Workflow_runtime_mongo.create ~client ~db ~collection:"lease_workflows" ()
+      in
+      Workflow_runtime_mongo.ensure backend_a |> expect_ok "ensure";
+      Workflow_runtime_mongo.enqueue backend_a ~now_ms:1_000L
+        (workflow "wf_expired")
+        (Workflow_runtime.enqueue_options ~run_at_ms:1_000L ())
+      |> expect_ok "enqueue";
+      Workflow_runtime_mongo.request_update backend_a ~workflow_id:"wf_expired"
+        ~now_ms:1_001L ~update_id:"upd_1" ~name:"set_target" ()
+      |> expect_ok "request update"
+      |> Alcotest.(check bool) "update requested" true;
+      let _claim =
+        Workflow_runtime_mongo.claim_workflow backend_a ~workflow_id:"wf_expired"
+          ~worker_id:"worker_a" ~now_ms:1_002L ~lease_ms:100L
+        |> expect_ok "claim"
+        |> Option.get
+      in
+      Workflow_runtime_mongo.heartbeat backend_a ~workflow_id:"wf_expired"
+        ~worker_id:"worker_a" ~now_ms:1_103L ~lease_ms:100L
+      |> expect_ok "stale heartbeat"
+      |> Alcotest.(check bool) "stale heartbeat rejected" false;
+      Workflow_runtime_mongo.complete backend_a ~workflow_id:"wf_expired"
+        ~worker_id:"worker_a" ~now_ms:1_103L ~status:Succeeded
+        ~message:"too late"
+      |> expect_ok "stale complete"
+      |> Alcotest.(check bool) "stale complete rejected" false;
+      Workflow_runtime_mongo.reschedule backend_a ~workflow_id:"wf_expired"
+        ~worker_id:"worker_a" ~now_ms:1_103L ~run_at_ms:2_000L
+        ~message:"too late"
+      |> expect_ok "stale reschedule"
+      |> Alcotest.(check bool) "stale reschedule rejected" false;
+      Workflow_runtime_mongo.schedule_timer backend_a ~workflow_id:"wf_expired"
+        ~worker_id:"worker_a" ~now_ms:1_103L ~timer_id:"wake"
+        ~run_at_ms:2_000L ~message:"too late" ()
+      |> expect_ok "stale timer"
+      |> Alcotest.(check bool) "stale timer rejected" false;
+      Workflow_runtime_mongo.start_child backend_a
+        ~parent_workflow_id:"wf_expired" ~worker_id:"worker_a"
+        ~now_ms:1_103L (workflow "wf_stale_child")
+        (Workflow_runtime.enqueue_options ())
+      |> expect_ok "stale child"
+      |> Alcotest.(check bool) "stale child rejected" false;
+      Workflow_runtime_mongo.complete_update backend_a
+        ~workflow_id:"wf_expired" ~worker_id:"worker_a" ~now_ms:1_103L
+        ~update_id:"upd_1" ~status:Workflow_runtime.Update_completed_status ()
+      |> expect_ok "stale complete update"
+      |> Alcotest.(check bool) "stale update completion rejected" false;
+      let policy = Workflow_runtime.retry_policy ~max_attempts:2 () in
+      let retry_attempt =
+        Workflow_runtime_mongo.retry backend_a ~workflow_id:"wf_expired"
+          ~worker_id:"worker_a" ~now_ms:1_103L ~policy ~message:"too late"
+        |> expect_ok "stale retry"
+        |> function
+        | Some (Workflow_runtime.Retried { attempt; _ })
+        | Some (Retries_exhausted { attempt }) ->
+            Some attempt
+        | None -> None
+      in
+      Alcotest.(check (option int)) "stale retry rejected" None retry_attempt;
+      let reclaimed =
+        Workflow_runtime_mongo.claim_workflow backend_b ~workflow_id:"wf_expired"
+          ~worker_id:"worker_b" ~now_ms:1_103L ~lease_ms:100L
+        |> expect_ok "reclaim"
+        |> Option.get
+      in
+      Alcotest.(check string) "reclaimed by worker b" "worker_b"
+        reclaimed.worker_id;
+      Workflow_runtime_mongo.complete backend_b ~workflow_id:"wf_expired"
+        ~worker_id:"worker_b" ~now_ms:1_104L ~status:Succeeded ~message:"done"
+      |> expect_ok "complete"
+      |> Alcotest.(check bool) "fresh owner completes" true;
+      let history =
+        Workflow_runtime_mongo.history ~workflow_id:"wf_expired" backend_b
+        |> expect_ok "history"
+      in
+      Alcotest.(check (list string))
+        "only valid owner events"
+        [
+          "workflow_enqueued";
+          "update_requested";
+          "workflow_claimed";
+          "workflow_claimed";
+          "workflow_completed";
+        ]
+        (List.map
+           (fun event ->
+             Workflow_runtime.event_kind_to_string event.Workflow_runtime.kind)
+           history);
+      let updates =
+        Workflow_runtime_mongo.updates ~workflow_id:"wf_expired" backend_b
+        |> expect_ok "updates"
+      in
+      let update = List.hd updates in
+      Alcotest.(check string) "update still pending" "pending"
+        (Workflow_runtime.update_status_to_string update.status))
+
 let test_mongo_activity_results_survive_backend_instances () =
   Eio_main.run @@ fun env ->
   Eio.Switch.run @@ fun sw ->
@@ -899,6 +1030,8 @@ let () =
         [
           Alcotest.test_case "claims and lease recovery" `Quick
             test_mongo_claims_and_lease_recovery;
+          Alcotest.test_case "owned operations require active lease" `Quick
+            test_mongo_owned_operations_require_active_lease;
           Alcotest.test_case "activity results survive backend instances" `Quick
             test_mongo_activity_results_survive_backend_instances;
           Alcotest.test_case "kind claim filter and retry policy" `Quick

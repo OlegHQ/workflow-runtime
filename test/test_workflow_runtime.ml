@@ -680,6 +680,85 @@ let test_validation () =
       Alcotest.fail
         ("unexpected error: " ^ Workflow_runtime.Memory_backend.error_to_string error)
 
+let test_owned_operations_require_active_lease () =
+  let now = ref 10_000L in
+  let module Runtime =
+    Workflow_runtime.Make (struct
+      let now_ms () = !now
+    end) (Workflow_runtime.Memory_backend)
+  in
+  let backend = Workflow_runtime.Memory_backend.create () in
+  Runtime.enqueue backend (workflow "wf_expired")
+    (Workflow_runtime.enqueue_options ())
+  |> expect_ok "enqueue";
+  let _claim =
+    Runtime.claim_workflow backend ~workflow_id:"wf_expired"
+      ~worker_id:"worker_a" ~lease_ms:100L
+    |> expect_ok "claim"
+    |> Option.get
+  in
+  now := 10_101L;
+  Runtime.heartbeat backend ~workflow_id:"wf_expired" ~worker_id:"worker_a"
+    ~lease_ms:100L
+  |> expect_ok "stale heartbeat"
+  |> Alcotest.(check bool) "stale heartbeat rejected" false;
+  Runtime.complete backend ~workflow_id:"wf_expired" ~worker_id:"worker_a"
+    ~status:Succeeded ~message:"too late"
+  |> expect_ok "stale complete"
+  |> Alcotest.(check bool) "stale complete rejected" false;
+  Runtime.reschedule backend ~workflow_id:"wf_expired" ~worker_id:"worker_a"
+    ~run_at_ms:20_000L ~message:"too late"
+  |> expect_ok "stale reschedule"
+  |> Alcotest.(check bool) "stale reschedule rejected" false;
+  Runtime.schedule_timer backend ~workflow_id:"wf_expired" ~worker_id:"worker_a"
+    ~timer_id:"wake" ~run_at_ms:20_000L ~message:"too late" ()
+  |> expect_ok "stale timer"
+  |> Alcotest.(check bool) "stale timer rejected" false;
+  Runtime.start_child backend ~parent_workflow_id:"wf_expired"
+    ~worker_id:"worker_a" (workflow "wf_stale_child")
+    (Workflow_runtime.enqueue_options ())
+  |> expect_ok "stale child"
+  |> Alcotest.(check bool) "stale child rejected" false;
+  let policy = Workflow_runtime.retry_policy ~max_attempts:2 () in
+  let retry_attempt =
+    Runtime.retry backend ~workflow_id:"wf_expired" ~worker_id:"worker_a"
+      ~policy ~message:"too late"
+    |> expect_ok "stale retry"
+    |> function
+    | Some (Workflow_runtime.Retried { attempt; _ })
+    | Some (Retries_exhausted { attempt }) ->
+        Some attempt
+    | None -> None
+  in
+  Alcotest.(check (option int)) "stale retry rejected" None retry_attempt;
+  let reclaimed =
+    Runtime.claim_workflow backend ~workflow_id:"wf_expired"
+      ~worker_id:"worker_b" ~lease_ms:100L
+    |> expect_ok "reclaim"
+    |> Option.get
+  in
+  Alcotest.(check string) "reclaimed by worker b" "worker_b"
+    reclaimed.worker_id;
+  now := 10_102L;
+  Runtime.complete backend ~workflow_id:"wf_expired" ~worker_id:"worker_b"
+    ~status:Succeeded ~message:"done"
+  |> expect_ok "complete"
+  |> Alcotest.(check bool) "fresh owner completes" true;
+  let history =
+    Runtime.history backend ~workflow_id:"wf_expired" |> expect_ok "history"
+  in
+  Alcotest.(check (list string))
+    "only valid owner events"
+    [
+      "workflow_enqueued";
+      "workflow_claimed";
+      "workflow_claimed";
+      "workflow_completed";
+    ]
+    (List.map
+       (fun event -> Workflow_runtime.event_kind_to_string event.Workflow_runtime.kind)
+       history)
+
 let () =
   Alcotest.run "workflow-runtime"
     [
@@ -705,5 +784,7 @@ let () =
           Alcotest.test_case "grouping filtering and reschedule" `Quick
             test_grouping_filtering_and_reschedule;
           Alcotest.test_case "validation" `Quick test_validation;
+          Alcotest.test_case "owned operations require active lease" `Quick
+            test_owned_operations_require_active_lease;
         ] );
     ]

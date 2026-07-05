@@ -819,11 +819,19 @@ let claim_workflow t ~workflow_id ~worker_id ~now_ms ~lease_ms =
   claim_with_query t ~query:(claim_query ~workflow_id ~now_ms ()) ~worker_id
     ~now_ms ~lease_ms
 
-let owned_query ~workflow_id ~worker_id =
-  doc [ string "_id" workflow_id; string "lease_owner" worker_id ]
+let active_owned_query ~workflow_id ~worker_id ~now_ms =
+  doc
+    [
+      string "_id" workflow_id;
+      string "status" (Workflow_runtime.status_to_string Running);
+      string "lease_owner" worker_id;
+      doc_element "lease_expires_at_ms" (doc [ ("$gt", Bson.create_int64 now_ms) ]);
+    ]
 
-let update_owned t ~workflow_id ~worker_id update =
-  find_and_modify t ~query:(owned_query ~workflow_id ~worker_id) ~update
+let update_owned t ~workflow_id ~worker_id ~now_ms update =
+  find_and_modify t
+    ~query:(active_owned_query ~workflow_id ~worker_id ~now_ms)
+    ~update
   |> Result.map (Option.map snd)
 
 let heartbeat t ~workflow_id ~worker_id ~now_ms ~lease_ms =
@@ -839,7 +847,7 @@ let heartbeat t ~workflow_id ~worker_id ~now_ms ~lease_ms =
         doc_element "$inc" (doc [ int32 "event_sequence" 1 ]);
       ]
   in
-  update_owned t ~workflow_id ~worker_id update
+  update_owned t ~workflow_id ~worker_id ~now_ms update
   |> function
   | Error _ as error -> error
   | Ok None -> Ok false
@@ -849,7 +857,14 @@ let heartbeat t ~workflow_id ~worker_id ~now_ms ~lease_ms =
         ~occurred_at_ms:now_ms ()
       |> Result.map (fun () -> true)
 
+let terminal_status = function
+  | Workflow_runtime.Succeeded | Blocked | Failed | Cancelled -> true
+  | Queued | Running -> false
+
 let complete t ~workflow_id ~worker_id ~now_ms ~status ~message =
+  if not (terminal_status status) then
+    Error (`Bad_document "complete requires a terminal status")
+  else
   let update =
     doc
       [
@@ -866,7 +881,7 @@ let complete t ~workflow_id ~worker_id ~now_ms ~status ~message =
           (doc [ string "lease_owner" ""; string "lease_expires_at_ms" "" ]);
       ]
   in
-  update_owned t ~workflow_id ~worker_id update
+  update_owned t ~workflow_id ~worker_id ~now_ms update
   |> function
   | Error _ as error -> error
   | Ok None -> Ok false
@@ -899,7 +914,7 @@ let reschedule t ~workflow_id ~worker_id ~now_ms ~run_at_ms ~message =
              ]);
       ]
   in
-  update_owned t ~workflow_id ~worker_id update
+  update_owned t ~workflow_id ~worker_id ~now_ms update
   |> function
   | Error _ as error -> error
   | Ok None -> Ok false
@@ -910,7 +925,7 @@ let reschedule t ~workflow_id ~worker_id ~now_ms ~run_at_ms ~message =
       |> Result.map (fun () -> true)
 
 let retry t ~workflow_id ~worker_id ~now_ms ~policy ~message =
-  let query = owned_query ~workflow_id ~worker_id in
+  let query = active_owned_query ~workflow_id ~worker_id ~now_ms in
   let find =
     Mongo_eio.direct_find_one t.client ~db:t.db
       ~collection:t.workflows_collection query
@@ -995,7 +1010,7 @@ let schedule_timer t ~workflow_id ~worker_id ~now_ms ~timer_id ~run_at_ms
   in
   let ( let* ) = Result.bind in
   let* updated =
-    update_owned t ~workflow_id ~worker_id workflow_update
+    update_owned t ~workflow_id ~worker_id ~now_ms workflow_update
   in
   match updated with
   | None -> Ok false
@@ -1347,7 +1362,7 @@ let child_started_event_exists t ~parent_workflow_id ~child_workflow_id =
          | _ -> false)
        events)
 
-let ensure_child_started_event t ~parent_workflow_id ~worker_id
+let ensure_child_started_event t ~parent_workflow_id ~worker_id ~now_ms
     (child : Workflow_runtime.child_workflow) =
   let ( let* ) = Result.bind in
   let* exists =
@@ -1357,7 +1372,7 @@ let ensure_child_started_event t ~parent_workflow_id ~worker_id
   if exists then Ok true
   else
     let update = doc [ doc_element "$inc" (doc [ int32 "event_sequence" 1 ]) ] in
-    update_owned t ~workflow_id:parent_workflow_id ~worker_id update
+    update_owned t ~workflow_id:parent_workflow_id ~worker_id ~now_ms update
     |> function
     | Error _ as error -> error
     | Ok None -> Ok false
@@ -1375,7 +1390,7 @@ let start_child t ~parent_workflow_id ~worker_id ~now_ms
   let* parent =
     Mongo_eio.direct_find_one t.client ~db:t.db
       ~collection:t.workflows_collection
-      (owned_query ~workflow_id:parent_workflow_id ~worker_id)
+      (active_owned_query ~workflow_id:parent_workflow_id ~worker_id ~now_ms)
     |> Result.map_error mongo_error
     |> function
     | Error _ as error -> error
@@ -1394,7 +1409,7 @@ let start_child t ~parent_workflow_id ~worker_id ~now_ms
         find_child_link t ~parent_workflow_id ~child_workflow_id:workflow.id
       in
       if Option.is_some existing_child then
-        ensure_child_started_event t ~parent_workflow_id ~worker_id
+        ensure_child_started_event t ~parent_workflow_id ~worker_id ~now_ms
           (Option.get existing_child)
       else
         let item =
@@ -1449,7 +1464,7 @@ let start_child t ~parent_workflow_id ~worker_id ~now_ms
           |> Result.map (fun _ -> ())
           |> Result.map_error mongo_error
         in
-        ensure_child_started_event t ~parent_workflow_id ~worker_id child
+        ensure_child_started_event t ~parent_workflow_id ~worker_id ~now_ms child
 
 let request_update t ~workflow_id ~now_ms ~update_id ~name ?payload_json () =
   let ( let* ) = Result.bind in
@@ -1524,7 +1539,7 @@ let complete_update t ~workflow_id ~worker_id ~now_ms ~update_id ~status
       let* owned =
         Mongo_eio.direct_find_one t.client ~db:t.db
           ~collection:t.workflows_collection
-          (owned_query ~workflow_id ~worker_id)
+          (active_owned_query ~workflow_id ~worker_id ~now_ms)
         |> Result.map_error mongo_error
         |> Result.map Option.is_some
       in
@@ -1571,7 +1586,7 @@ let complete_update t ~workflow_id ~worker_id ~now_ms ~update_id ~status
             let workflow_update =
               doc [ doc_element "$inc" (doc [ int32 "event_sequence" 1 ]) ]
             in
-            update_owned t ~workflow_id ~worker_id workflow_update
+            update_owned t ~workflow_id ~worker_id ~now_ms workflow_update
             |> function
             | Error _ as error -> error
             | Ok None -> Ok false

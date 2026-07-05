@@ -15,6 +15,9 @@ reusable Eio worker runner over the same functorized runtime API.
 - Atomic worker claims with expiring leases.
 - Worker heartbeats to extend active leases.
 - Lease expiry recovery after worker/process crashes.
+- Owner-gated workflow mutations require an active, unexpired lease; stale
+  workers cannot complete, reschedule, retry, schedule timers, start children,
+  complete updates, or heartbeat after lease expiry.
 - Terminal completion as `succeeded`, `blocked`, or `failed`.
 - Durable cancellation as `cancelled`, including active lease release and a
   replayable `workflow_cancelled` audit event.
