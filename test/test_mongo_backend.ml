@@ -178,8 +178,14 @@ let test_mongo_claims_and_lease_recovery () =
       Alcotest.(check bool)
         "due claim index" true (List.mem "workflow_due_idx" indexes);
       Alcotest.(check bool)
+        "due claim order index" true
+        (List.mem "workflow_due_order_idx" indexes);
+      Alcotest.(check bool)
         "kind due claim index" true
         (List.mem "workflow_kind_due_idx" indexes);
+      Alcotest.(check bool)
+        "kind due claim order index" true
+        (List.mem "workflow_kind_due_order_idx" indexes);
       Alcotest.(check bool)
         "expired lease claim index" true
         (List.mem "workflow_expired_lease_idx" indexes);
@@ -259,6 +265,64 @@ let test_mongo_claims_and_lease_recovery () =
       let completion = replay.Workflow_runtime.completion |> Option.get in
       Alcotest.(check string) "replay completion" "succeeded"
         (Workflow_runtime.status_to_string completion.status))
+
+let test_mongo_claims_same_due_time_by_workflow_id () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let config =
+    Mongo_config.
+      {
+        (default ~host ~port ~database:db ()) with
+        direct_connection = true;
+        server_selection_timeout_ms = 2_000;
+        connect_timeout_ms = 2_000;
+        socket_timeout_ms = Some 5_000;
+        app_name = Some "workflow-runtime-e2e";
+      }
+  in
+  let client =
+    match
+      Mongo_eio.connect ~sw ~net:(Eio.Stdenv.net env)
+        ~clock:(Eio.Stdenv.clock env) ~config
+    with
+    | Ok client -> client
+    | Error error ->
+        Alcotest.fail ("connect: " ^ Mongo_error.to_string error)
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      let _ =
+        Mongo_eio.direct_run_command client db
+          [ ("dropDatabase", Bson.create_int32 1l) ]
+      in
+      Mongo_eio.close_direct client)
+    (fun () ->
+      let backend =
+        Workflow_runtime_mongo.create ~client ~db ~collection:"ordered_workflows" ()
+      in
+      Workflow_runtime_mongo.ensure backend |> expect_ok "ensure";
+      Workflow_runtime_mongo.enqueue backend ~now_ms:1_000L (workflow "wf_b")
+        (Workflow_runtime.enqueue_options ~run_at_ms:2_000L ())
+      |> expect_ok "enqueue wf_b";
+      Workflow_runtime_mongo.enqueue backend ~now_ms:1_000L (workflow "wf_a")
+        (Workflow_runtime.enqueue_options ~run_at_ms:2_000L ())
+      |> expect_ok "enqueue wf_a";
+      let first =
+        Workflow_runtime_mongo.claim_next backend ~worker_id:"worker_a"
+          ~now_ms:2_000L ~lease_ms:100L
+        |> expect_ok "claim first"
+        |> Option.get
+      in
+      Alcotest.(check string)
+        "same due time uses workflow id tie breaker" "wf_a"
+        first.item.workflow.id;
+      let second =
+        Workflow_runtime_mongo.claim_next backend ~worker_id:"worker_a"
+          ~now_ms:2_000L ~lease_ms:100L
+        |> expect_ok "claim second"
+        |> Option.get
+      in
+      Alcotest.(check string) "second workflow" "wf_b" second.item.workflow.id)
 
 let test_mongo_owned_operations_require_active_lease () =
   Eio_main.run @@ fun env ->
@@ -1348,6 +1412,8 @@ let () =
           Alcotest.test_case "validation" `Quick test_mongo_validation;
           Alcotest.test_case "claims and lease recovery" `Quick
             test_mongo_claims_and_lease_recovery;
+          Alcotest.test_case "claims same due time by workflow id" `Quick
+            test_mongo_claims_same_due_time_by_workflow_id;
           Alcotest.test_case "owned operations require active lease" `Quick
             test_mongo_owned_operations_require_active_lease;
           Alcotest.test_case "activity results survive backend instances" `Quick

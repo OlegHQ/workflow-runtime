@@ -454,8 +454,23 @@ let ensure t =
   let* () =
     Mongo_eio.direct_ensure_index t.client ~db:t.db
       ~collection:t.workflows_collection
+      (index_key [ int32 "status" 1; int32 "run_at_ms" 1; int32 "_id" 1 ])
+      [ Mongo_index.Name "workflow_due_order_idx" ]
+    |> Result.map_error mongo_error
+  in
+  let* () =
+    Mongo_eio.direct_ensure_index t.client ~db:t.db
+      ~collection:t.workflows_collection
       (index_key [ int32 "status" 1; int32 "kind" 1; int32 "run_at_ms" 1 ])
       [ Mongo_index.Name "workflow_kind_due_idx" ]
+    |> Result.map_error mongo_error
+  in
+  let* () =
+    Mongo_eio.direct_ensure_index t.client ~db:t.db
+      ~collection:t.workflows_collection
+      (index_key
+         [ int32 "status" 1; int32 "kind" 1; int32 "run_at_ms" 1; int32 "_id" 1 ])
+      [ Mongo_index.Name "workflow_kind_due_order_idx" ]
     |> Result.map_error mongo_error
   in
   let* () =
@@ -670,7 +685,7 @@ let find_and_modify t ~query ~update =
     [
       ("findAndModify", Bson.create_string t.workflows_collection);
       ("query", Bson.create_doc_element query);
-      ("sort", Bson.create_doc_element (doc [ int32 "run_at_ms" 1 ]));
+      ("sort", Bson.create_doc_element (doc [ int32 "run_at_ms" 1; int32 "_id" 1 ]));
       ("update", Bson.create_doc_element update);
       ("new", Bson.create_boolean true);
     ]

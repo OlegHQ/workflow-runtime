@@ -33,6 +33,8 @@ reusable Eio worker runner over the same functorized runtime API.
 - Kind-filtered claims for task-queue style workers.
 - Mongo `ensure` provisions claim indexes for due queued work and expired
   running leases, both globally and by workflow kind.
+- Mongo claims use a deterministic due-time plus workflow-id order, matching the
+  in-memory backend and avoiding collection natural-order drift.
 - Retry policy support with bounded exponential backoff and terminal exhaustion.
 - Durable timers that release the worker lease, persist wake-up metadata, and
   append `timer_fired` before the resumed claim.
