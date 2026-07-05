@@ -535,6 +535,17 @@ let append_event t ~workflow_id ~sequence ~kind ?worker_id ?payload_json ?messag
   |> Result.map (fun _ -> ())
   |> Result.map_error mongo_error
 
+let event_with_message_exists t ~workflow_id ~kind ~message =
+  Mongo_eio.direct_find_one t.client ~db:t.db ~collection:t.events_collection
+    (doc
+       [
+         string "workflow_id" workflow_id;
+         string "kind" (Workflow_runtime.event_kind_to_string kind);
+         string "message" message;
+       ])
+  |> Result.map_error mongo_error
+  |> Result.map Option.is_some
+
 let timer_payload ~timer_id ~run_at_ms =
   Printf.sprintf {|{"timer_id":%S,"run_at_ms":%Ld}|} timer_id run_at_ms
 
@@ -723,6 +734,36 @@ let due_timers t ~workflow_id ~now_ms =
         (Ok []) docs
       |> Result.map List.rev
 
+let fired_timers t ~workflow_id =
+  let filter =
+    doc
+      [
+        string "workflow_id" workflow_id;
+        doc_element "fired_at_ms" (doc [ ("$ne", Bson.create_null ()) ]);
+      ]
+  in
+  let opts =
+    {
+      (Mongo_crud.default_find t.timers_collection filter) with
+      sort = Some (doc [ int32 "run_at_ms" 1; int32 "timer_id" 1 ]);
+    }
+  in
+  Mongo_eio.direct_find t.client ~db:t.db ~collection:t.timers_collection opts
+  |> Result.map_error mongo_error
+  |> function
+  | Error _ as error -> error
+  | Ok docs ->
+      List.fold_left
+        (fun acc bson ->
+          match acc with
+          | Error _ as error -> error
+          | Ok timers -> (
+              match decode_timer bson with
+              | Ok timer -> Ok (timer :: timers)
+              | Error _ as error -> error))
+        (Ok []) docs
+      |> Result.map List.rev
+
 let mark_timer_fired t ~now_ms (timer : Workflow_runtime.timer) =
   let selector =
     doc
@@ -747,36 +788,58 @@ let mark_timer_fired t ~now_ms (timer : Workflow_runtime.timer) =
 let fire_due_timers t ~workflow_id ~now_ms ~first_sequence =
   let ( let* ) = Result.bind in
   let* timers = due_timers t ~workflow_id ~now_ms in
-  let rec loop next_sequence fired_any = function
+  let append_timer_fired next_sequence (timer : Workflow_runtime.timer) =
+    let occurred_at_ms =
+      Option.value timer.fired_at_ms ~default:now_ms
+    in
+    append_event t ~workflow_id ~sequence:next_sequence
+      ~kind:Workflow_runtime.Timer_fired ?payload_json:timer.payload_json
+      ~message:timer.timer_id ~occurred_at_ms ()
+  in
+  let next_sequence_after_event next_sequence =
+    match increment_event_sequence t ~workflow_id with
+    | Error _ as error -> error
+    | Ok (Some sequence) -> Ok sequence
+    | Ok None -> Error (`Bad_document ("unknown workflow: " ^ workflow_id))
+  in
+  let rec loop_due next_sequence fired_any = function
     | [] ->
-        if fired_any then
-          match increment_event_sequence t ~workflow_id with
-          | Error _ as error -> error
-          | Ok (Some sequence) -> Ok sequence
-          | Ok None -> Error (`Bad_document ("unknown workflow: " ^ workflow_id))
+        if fired_any then next_sequence_after_event next_sequence
         else Ok next_sequence
-    | timer :: rest ->
+    | (timer : Workflow_runtime.timer) :: rest ->
         let* marked = mark_timer_fired t ~now_ms timer in
-        if not marked then loop next_sequence fired_any rest
+        if not marked then loop_due next_sequence fired_any rest
         else
-          let* () =
-            append_event t ~workflow_id ~sequence:next_sequence
-              ~kind:Workflow_runtime.Timer_fired ?payload_json:timer.payload_json
-              ~message:timer.timer_id ~occurred_at_ms:now_ms ()
-          in
+          let* () = append_timer_fired next_sequence timer in
           let* next_sequence =
             match rest with
             | [] -> Ok next_sequence
-            | _ -> (
-                match increment_event_sequence t ~workflow_id with
-                | Error _ as error -> error
-                | Ok (Some sequence) -> Ok sequence
-                | Ok None ->
-                    Error (`Bad_document ("unknown workflow: " ^ workflow_id)))
+            | _ -> next_sequence_after_event next_sequence
           in
-          loop next_sequence true rest
+          loop_due next_sequence true rest
   in
-  loop first_sequence false timers
+  let* next_sequence = loop_due first_sequence false timers in
+  let* fired_timers = fired_timers t ~workflow_id in
+  let rec loop_repairs next_sequence repaired_any = function
+    | [] ->
+        if repaired_any then next_sequence_after_event next_sequence
+        else Ok next_sequence
+    | (timer : Workflow_runtime.timer) :: rest ->
+        let* exists =
+          event_with_message_exists t ~workflow_id
+            ~kind:Workflow_runtime.Timer_fired ~message:timer.timer_id
+        in
+        if exists then loop_repairs next_sequence repaired_any rest
+        else
+          let* () = append_timer_fired next_sequence timer in
+          let* next_sequence =
+            match rest with
+            | [] -> Ok next_sequence
+            | _ -> next_sequence_after_event next_sequence
+          in
+          loop_repairs next_sequence true rest
+  in
+  loop_repairs next_sequence false fired_timers
 
 let claim_with_query t ~query ~worker_id ~now_ms ~lease_ms =
   let lease_expires_at_ms = Int64.add now_ms lease_ms in

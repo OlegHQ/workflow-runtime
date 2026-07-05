@@ -34,6 +34,8 @@ let bson_doc fields =
 
 let bson_string name value = (name, Bson.create_string value)
 
+let bson_int64 name value = (name, Bson.create_int64 value)
+
 let bson_doc_element name value = (name, Bson.create_doc_element value)
 
 let test_mongo_claims_and_lease_recovery () =
@@ -568,6 +570,18 @@ let test_mongo_timer_survives_and_fires_across_backend_instances () =
       Alcotest.(check int) "one timer" 1 (List.length timers);
       Alcotest.(check (option int64)) "not fired" None
         (List.hd timers).fired_at_ms;
+      Mongo_eio.direct_update_one client ~db ~collection:"timer_workflows_timers"
+        ~upsert:false
+        (bson_doc [ bson_string "_id" "wf_timer:sleep_1" ])
+        (bson_doc
+           [
+             bson_doc_element "$set"
+               (bson_doc
+                  [ bson_int64 "fired_at_ms" 5_000L; bson_int64 "updated_at_ms" 5_000L ]);
+           ])
+      |> Result.map_error (fun error -> `Mongo (Mongo_error.to_string error))
+      |> expect_ok "simulate fired timer without event"
+      |> ignore;
       let fired =
         Workflow_runtime_mongo.claim_workflow backend_b ~workflow_id:"wf_timer"
           ~worker_id:"late-worker" ~now_ms:5_000L ~lease_ms:10_000L

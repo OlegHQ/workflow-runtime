@@ -32,6 +32,8 @@ reusable Eio worker runner over the same functorized runtime API.
 - Retry policy support with bounded exponential backoff and terminal exhaustion.
 - Durable timers that release the worker lease, persist wake-up metadata, and
   append `timer_fired` before the resumed claim.
+- Fired timers repair missing `timer_fired` history events from durable timer
+  records on later claims.
 - Pure deterministic replay over event history for workflow-visible completion,
   timer, activity-result, and signal state.
 - Idempotent external workflow signals, keyed by workflow id and signal id.
