@@ -1006,6 +1006,22 @@ let test_mongo_child_workflows_can_nest_across_backend_instances () =
         (Workflow_runtime.enqueue_options ~payload_json:{|{"step":1}|} ())
       |> expect_ok "start child"
       |> Alcotest.(check bool) "child started" true;
+      Mongo_eio.direct_delete_many client ~db
+        ~collection:"child_workflows_child_workflows"
+        (bson_doc [ bson_string "_id" "wf_parent:wf_child" ])
+      |> Result.map_error (fun error -> `Mongo (Mongo_error.to_string error))
+      |> expect_ok "delete child link"
+      |> ignore;
+      Mongo_eio.direct_delete_many client ~db
+        ~collection:"child_workflows_events"
+        (bson_doc
+           [
+             bson_string "workflow_id" "wf_parent";
+             bson_string "kind" "child_workflow_started";
+           ])
+      |> Result.map_error (fun error -> `Mongo (Mongo_error.to_string error))
+      |> expect_ok "delete parent child event"
+      |> ignore;
       Workflow_runtime_mongo.start_child backend_a ~parent_workflow_id:"wf_parent"
         ~worker_id:"parent_worker" ~now_ms:8_003L
         (workflow_kind "wf_child" "child_step")

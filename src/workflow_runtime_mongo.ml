@@ -1523,6 +1523,16 @@ let find_child_link t ~parent_workflow_id ~child_workflow_id =
   | Ok None -> Ok None
   | Ok (Some bson) -> decode_child bson |> Result.map Option.some
 
+let find_workflow_item t ~workflow_id =
+  Mongo_eio.direct_find_one t.client ~db:t.db
+    ~collection:t.workflows_collection
+    (doc [ string "_id" workflow_id ])
+  |> Result.map_error mongo_error
+  |> function
+  | Error _ as error -> error
+  | Ok None -> Ok None
+  | Ok (Some bson) -> decode_item bson |> Result.map Option.some
+
 let child_started_event_exists t ~parent_workflow_id ~child_workflow_id =
   let ( let* ) = Result.bind in
   let* events = history ~workflow_id:parent_workflow_id t in
@@ -1555,6 +1565,45 @@ let ensure_child_started_event t ~parent_workflow_id ~worker_id ~now_ms
           ~payload_json:(child_workflow_payload child)
           ~message:child.child_workflow_id ~occurred_at_ms:child.started_at_ms ()
         |> Result.map (fun () -> true)
+
+let ensure_child_enqueued_event t ~now_ms (item : Workflow_runtime.item) =
+  let ( let* ) = Result.bind in
+  let* history = history ~workflow_id:item.workflow.id t in
+  if
+    List.exists
+      (fun (event : Workflow_runtime.event) ->
+        event.kind = Workflow_runtime.Workflow_enqueued)
+      history
+  then Ok ()
+  else
+    append_event t ~workflow_id:item.workflow.id ~sequence:1
+      ~kind:Workflow_runtime.Workflow_enqueued ?payload_json:item.payload_json
+      ~occurred_at_ms:now_ms ()
+
+let ensure_child_link t (child : Workflow_runtime.child_workflow) =
+  let child_doc = child_workflow_doc_of_child child in
+  Mongo_eio.direct_update_one t.client ~db:t.db
+    ~collection:t.child_workflows_collection ~upsert:true
+    (doc [ string "_id" child_doc.id ])
+    (doc [ doc_element "$setOnInsert" (child_workflow_doc_to_bson_doc child_doc) ])
+  |> Result.map_error mongo_error
+  |> Result.map (fun _ -> ())
+
+let repair_existing_child t ~parent_workflow_id ~worker_id ~now_ms
+    (item : Workflow_runtime.item) =
+  let child =
+    Workflow_runtime.
+      {
+        parent_workflow_id;
+        child_workflow_id = item.workflow.id;
+        child_kind = item.workflow.kind;
+        started_at_ms = item.created_at_ms;
+      }
+  in
+  let ( let* ) = Result.bind in
+  let* () = ensure_child_enqueued_event t ~now_ms item in
+  let* () = ensure_child_link t child in
+  ensure_child_started_event t ~parent_workflow_id ~worker_id ~now_ms child
 
 let start_child t ~parent_workflow_id ~worker_id ~now_ms
     (workflow : Workflow_runtime.workflow)
@@ -1614,30 +1663,32 @@ let start_child t ~parent_workflow_id ~worker_id ~now_ms
               started_at_ms = now_ms;
             }
         in
-        let child_doc = child_workflow_doc_of_child child in
-        let* () =
-          Mongo_eio.direct_insert_one t.client ~db:t.db
-            ~collection:t.workflows_collection
-            (workflow_doc_to_bson_doc workflow_doc)
-          |> Result.map (fun _ -> ())
-          |> Result.map_error (fun error ->
-                 if Mongo_error.is_duplicate_key error then
-                   `Duplicate_workflow workflow.Workflow_runtime.id
-                 else mongo_error error)
-        in
-        let* () =
-          append_event t ~workflow_id:workflow.id ~sequence:1
-            ~kind:Workflow_runtime.Workflow_enqueued
-            ?payload_json:options.payload_json ~occurred_at_ms:now_ms ()
-        in
-        let* () =
-          Mongo_eio.direct_insert_one t.client ~db:t.db
-            ~collection:t.child_workflows_collection
-            (child_workflow_doc_to_bson_doc child_doc)
-          |> Result.map (fun _ -> ())
-          |> Result.map_error mongo_error
-        in
-        ensure_child_started_event t ~parent_workflow_id ~worker_id ~now_ms child
+        Mongo_eio.direct_insert_one t.client ~db:t.db
+          ~collection:t.workflows_collection
+          (workflow_doc_to_bson_doc workflow_doc)
+        |> Result.map_error (fun error ->
+               if Mongo_error.is_duplicate_key error then
+                 `Duplicate_workflow workflow.Workflow_runtime.id
+               else mongo_error error)
+        |> function
+        | Error (`Duplicate_workflow _) ->
+            let* existing =
+              find_workflow_item t ~workflow_id:workflow.id
+            in
+            (match existing with
+            | None -> Ok false
+            | Some item ->
+                repair_existing_child t ~parent_workflow_id ~worker_id ~now_ms
+                  item)
+        | Error _ as error -> error
+        | Ok _ ->
+            let* () =
+              append_event t ~workflow_id:workflow.id ~sequence:1
+                ~kind:Workflow_runtime.Workflow_enqueued
+                ?payload_json:options.payload_json ~occurred_at_ms:now_ms ()
+            in
+            let* () = ensure_child_link t child in
+            ensure_child_started_event t ~parent_workflow_id ~worker_id ~now_ms child
 
 let request_update t ~workflow_id ~now_ms ~update_id ~name ?payload_json () =
   let ( let* ) = Result.bind in

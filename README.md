@@ -48,6 +48,8 @@ reusable Eio worker runner over the same functorized runtime API.
 - Durable child workflows: any claimed workflow can start normal child
   workflows, children can start their own children, and parent histories replay
   `child_workflow_started` events.
+- Duplicate child starts repair missing child-link and parent history records
+  when the child workflow record already exists.
 - Reusable Eio worker runner for polling, kind-filtered claims, handler
   execution, heartbeat-based lease extension, durable completion, reschedule,
   retry, and handler-failure recording.
