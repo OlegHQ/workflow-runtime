@@ -54,6 +54,7 @@ type backend_capabilities = {
   activity_results : bool;
   task_queue_filtering : bool;
   retry_backoff : bool;
+  durable_timers : bool;
 }
 
 type event_kind =
@@ -93,6 +94,16 @@ type activity_result = {
   updated_at_ms : int64;
 }
 
+type timer = {
+  timer_id : string;
+  workflow_id : string;
+  run_at_ms : int64;
+  payload_json : string option;
+  fired_at_ms : int64 option;
+  created_at_ms : int64;
+  updated_at_ms : int64;
+}
+
 type retry_policy = {
   max_attempts : int;
   initial_backoff_ms : int64;
@@ -124,6 +135,7 @@ val activity_status_of_string : string -> (activity_status, string) result
 val item_to_yojson : item -> Yojson.Safe.t
 val event_to_yojson : event -> Yojson.Safe.t
 val activity_result_to_yojson : activity_result -> Yojson.Safe.t
+val timer_to_yojson : timer -> Yojson.Safe.t
 val items_to_yojson : ?group_by_tenant:bool -> item list -> Yojson.Safe.t
 val stats : item list -> stats
 val retry_delay_ms : retry_policy -> attempt:int -> int64
@@ -188,8 +200,21 @@ module type BACKEND = sig
     message:string ->
     (retry_decision option, error) result
 
+  val schedule_timer :
+    t ->
+    workflow_id:string ->
+    worker_id:string ->
+    now_ms:int64 ->
+    timer_id:string ->
+    run_at_ms:int64 ->
+    ?payload_json:string ->
+    message:string ->
+    unit ->
+    (bool, error) result
+
   val snapshot : ?tenant_id:string -> t -> (item list, error) result
   val history : workflow_id:string -> t -> (event list, error) result
+  val timers : workflow_id:string -> t -> (timer list, error) result
 
   val record_activity_result :
     t -> now_ms:int64 -> activity_result -> (unit, error) result
@@ -259,9 +284,21 @@ module type S = sig
     message:string ->
     (retry_decision option, error) result
 
+  val schedule_timer :
+    backend ->
+    workflow_id:string ->
+    worker_id:string ->
+    timer_id:string ->
+    run_at_ms:int64 ->
+    ?payload_json:string ->
+    message:string ->
+    unit ->
+    (bool, error) result
+
   val snapshot : ?tenant_id:string -> backend -> (item list, error) result
   val snapshot_json : ?tenant_id:string -> ?group_by_tenant:bool -> backend -> (Yojson.Safe.t, error) result
   val history : workflow_id:string -> backend -> (event list, error) result
+  val timers : workflow_id:string -> backend -> (timer list, error) result
 
   val record_activity_result :
     backend -> activity_result -> (unit, error) result

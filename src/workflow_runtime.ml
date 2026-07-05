@@ -47,6 +47,7 @@ type backend_capabilities = {
   activity_results : bool;
   task_queue_filtering : bool;
   retry_backoff : bool;
+  durable_timers : bool;
 }
 
 type event_kind =
@@ -83,6 +84,16 @@ type activity_result = {
   status : activity_status;
   result_json : string option;
   error : string option;
+  updated_at_ms : int64;
+}
+
+type timer = {
+  timer_id : string;
+  workflow_id : string;
+  run_at_ms : int64;
+  payload_json : string option;
+  fired_at_ms : int64 option;
+  created_at_ms : int64;
   updated_at_ms : int64;
 }
 
@@ -231,6 +242,18 @@ let activity_result_to_yojson result =
       ("updated_at_ms", int64_json result.updated_at_ms);
     ]
 
+let timer_to_yojson timer =
+  `Assoc
+    [
+      ("timer_id", `String timer.timer_id);
+      ("workflow_id", `String timer.workflow_id);
+      ("run_at_ms", int64_json timer.run_at_ms);
+      ("payload_json", option_json (fun value -> `String value) timer.payload_json);
+      ("fired_at_ms", option_json int64_json timer.fired_at_ms);
+      ("created_at_ms", int64_json timer.created_at_ms);
+      ("updated_at_ms", int64_json timer.updated_at_ms);
+    ]
+
 let empty_stats =
   { total = 0; queued = 0; running = 0; succeeded = 0; blocked = 0; failed = 0 }
 
@@ -348,8 +371,21 @@ module type BACKEND = sig
     message:string ->
     (retry_decision option, error) result
 
+  val schedule_timer :
+    t ->
+    workflow_id:string ->
+    worker_id:string ->
+    now_ms:int64 ->
+    timer_id:string ->
+    run_at_ms:int64 ->
+    ?payload_json:string ->
+    message:string ->
+    unit ->
+    (bool, error) result
+
   val snapshot : ?tenant_id:string -> t -> (item list, error) result
   val history : workflow_id:string -> t -> (event list, error) result
+  val timers : workflow_id:string -> t -> (timer list, error) result
 
   val record_activity_result :
     t -> now_ms:int64 -> activity_result -> (unit, error) result
@@ -419,9 +455,21 @@ module type S = sig
     message:string ->
     (retry_decision option, error) result
 
+  val schedule_timer :
+    backend ->
+    workflow_id:string ->
+    worker_id:string ->
+    timer_id:string ->
+    run_at_ms:int64 ->
+    ?payload_json:string ->
+    message:string ->
+    unit ->
+    (bool, error) result
+
   val snapshot : ?tenant_id:string -> backend -> (item list, error) result
   val snapshot_json : ?tenant_id:string -> ?group_by_tenant:bool -> backend -> (Yojson.Safe.t, error) result
   val history : workflow_id:string -> backend -> (event list, error) result
+  val timers : workflow_id:string -> backend -> (timer list, error) result
 
   val record_activity_result :
     backend -> activity_result -> (unit, error) result
@@ -447,8 +495,12 @@ module Make (Clock : CLOCK) (Backend : BACKEND) = struct
   let complete backend ~workflow_id ~worker_id ~status ~message = Backend.complete backend ~workflow_id ~worker_id ~now_ms:(Clock.now_ms ()) ~status ~message
   let reschedule backend ~workflow_id ~worker_id ~run_at_ms ~message = Backend.reschedule backend ~workflow_id ~worker_id ~now_ms:(Clock.now_ms ()) ~run_at_ms ~message
   let retry backend ~workflow_id ~worker_id ~policy ~message = Backend.retry backend ~workflow_id ~worker_id ~now_ms:(Clock.now_ms ()) ~policy ~message
+  let schedule_timer backend ~workflow_id ~worker_id ~timer_id ~run_at_ms ?payload_json ~message () =
+    Backend.schedule_timer backend ~workflow_id ~worker_id ~now_ms:(Clock.now_ms ())
+      ~timer_id ~run_at_ms ?payload_json ~message ()
   let snapshot = Backend.snapshot
   let history = Backend.history
+  let timers = Backend.timers
   let record_activity_result backend result =
     Backend.record_activity_result backend ~now_ms:(Clock.now_ms ()) result
   let find_activity_result = Backend.find_activity_result
@@ -471,6 +523,7 @@ module Memory_backend = struct
     records : (string, record) Hashtbl.t;
     events : (string, event list) Hashtbl.t;
     activity_results : (string, activity_result) Hashtbl.t;
+    timers : (string, timer) Hashtbl.t;
   }
 
   let create () =
@@ -479,6 +532,7 @@ module Memory_backend = struct
       records = Hashtbl.create 128;
       events = Hashtbl.create 128;
       activity_results = Hashtbl.create 128;
+      timers = Hashtbl.create 128;
     }
 
   let error_to_string = function
@@ -499,9 +553,11 @@ module Memory_backend = struct
       activity_results = true;
       task_queue_filtering = true;
       retry_backoff = true;
+      durable_timers = false;
     }
 
   let activity_key ~workflow_id ~activity_id = workflow_id ^ "\000" ^ activity_id
+  let timer_key ~workflow_id ~timer_id = workflow_id ^ "\000" ^ timer_id
 
   let append_event record ~workflow_id ~kind ?worker_id ?payload_json ?message
       ~occurred_at_ms t =
@@ -522,7 +578,7 @@ module Memory_backend = struct
     let existing = Option.value (Hashtbl.find_opt t.events workflow_id) ~default:[] in
     Hashtbl.replace t.events workflow_id (event :: existing)
 
-  let enqueue t ~now_ms workflow options =
+  let enqueue t ~now_ms workflow (options : enqueue_options) =
     match validate_workflow workflow with
     | Error message -> Error (`Invalid_workflow message)
     | Ok () ->
@@ -569,6 +625,27 @@ module Memory_backend = struct
     | None -> true
     | Some kind -> String.equal item.workflow.kind kind
 
+  let timer_payload ~timer_id ~run_at_ms =
+    Printf.sprintf {|{"timer_id":%S,"run_at_ms":%Ld}|} timer_id run_at_ms
+
+  let fire_due_timers t record ~now_ms =
+    t.timers |> Hashtbl.to_seq_values |> List.of_seq
+    |> List.filter (fun timer ->
+           String.equal timer.workflow_id record.item.workflow.id
+           && timer.run_at_ms <= now_ms
+           && Option.is_none timer.fired_at_ms)
+    |> List.sort (fun a b ->
+           let by_due = Int64.compare a.run_at_ms b.run_at_ms in
+           if by_due <> 0 then by_due else String.compare a.timer_id b.timer_id)
+    |> List.iter (fun timer ->
+           let fired = { timer with fired_at_ms = Some now_ms; updated_at_ms = now_ms } in
+           Hashtbl.replace t.timers
+             (timer_key ~workflow_id:timer.workflow_id ~timer_id:timer.timer_id)
+             fired;
+           append_event record ~workflow_id:timer.workflow_id ~kind:Timer_fired
+             ?payload_json:timer.payload_json ~message:timer.timer_id
+             ~occurred_at_ms:now_ms t)
+
   let claim_next ?kind t ~worker_id ~now_ms ~lease_ms =
     with_lock t (fun () ->
         let candidate =
@@ -586,6 +663,7 @@ module Memory_backend = struct
         | Some record ->
             let item = record.item in
             let lease_expires_at_ms = Int64.add now_ms lease_ms in
+            fire_due_timers t record ~now_ms;
             let claimed =
               {
                 item with
@@ -609,6 +687,7 @@ module Memory_backend = struct
         | Some record when claimable ~now_ms record.item ->
             let item = record.item in
             let lease_expires_at_ms = Int64.add now_ms lease_ms in
+            fire_due_timers t record ~now_ms;
             let claimed =
               {
                 item with
@@ -631,6 +710,41 @@ module Memory_backend = struct
     match item.lease_owner with
     | Some owner -> String.equal owner worker_id
     | None -> false
+
+  let schedule_timer t ~workflow_id ~worker_id ~now_ms ~timer_id ~run_at_ms
+      ?payload_json ~message () =
+    with_lock t (fun () ->
+        match Hashtbl.find_opt t.records workflow_id with
+        | Some record when owned_by record.item worker_id ->
+            let item = record.item in
+            let timer =
+              {
+                timer_id;
+                workflow_id;
+                run_at_ms;
+                payload_json;
+                fired_at_ms = None;
+                created_at_ms = now_ms;
+                updated_at_ms = now_ms;
+              }
+            in
+            Hashtbl.replace t.timers (timer_key ~workflow_id ~timer_id) timer;
+            record.item <-
+              {
+                item with
+                status = Queued;
+                run_at_ms;
+                lease_owner = None;
+                lease_expires_at_ms = None;
+                finished_at_ms = None;
+                message = Some message;
+                updated_at_ms = now_ms;
+              };
+            append_event record ~workflow_id ~kind:Timer_scheduled ~worker_id
+              ~payload_json:(timer_payload ~timer_id ~run_at_ms)
+              ~message ~occurred_at_ms:now_ms t;
+            Ok true
+        | _ -> Ok false)
 
   let heartbeat t ~workflow_id ~worker_id ~now_ms ~lease_ms =
     with_lock t (fun () ->
@@ -754,7 +868,16 @@ module Memory_backend = struct
         |> List.sort (fun a b -> Int.compare a.sequence b.sequence)
         |> Result.ok)
 
-  let record_activity_result t ~now_ms result =
+  let timers ~workflow_id t =
+    with_lock t (fun () ->
+        t.timers |> Hashtbl.to_seq_values |> List.of_seq
+        |> List.filter (fun timer -> String.equal timer.workflow_id workflow_id)
+        |> List.sort (fun a b ->
+               let by_due = Int64.compare a.run_at_ms b.run_at_ms in
+               if by_due <> 0 then by_due else String.compare a.timer_id b.timer_id)
+        |> Result.ok)
+
+  let record_activity_result t ~now_ms (result : activity_result) =
     with_lock t (fun () ->
         match Hashtbl.find_opt t.records result.workflow_id with
         | None -> Error (`Invalid_workflow ("unknown workflow: " ^ result.workflow_id))

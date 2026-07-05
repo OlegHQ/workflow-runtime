@@ -21,6 +21,8 @@ for atomic multi-instance claims.
   completed side effects.
 - Kind-filtered claims for task-queue style workers.
 - Retry policy support with bounded exponential backoff and terminal exhaustion.
+- Durable timers that release the worker lease, persist wake-up metadata, and
+  append `timer_fired` before the resumed claim.
 - Tenant-filtered and tenant-grouped snapshots.
 - Core runtime has no dependency on Eio, Dream, Mongo, or application domain
   types.
@@ -33,12 +35,11 @@ durable Event History, task queues, workflow replay, activity result
 preservation, durable timers, retries, timeouts, and worker polling. This
 library implements a smaller reusable foundation: durable state, atomic claims,
 task-queue filtering, leases, heartbeats, recovery, ordered event history,
-activity-result preservation, retry backoff, and visibility.
+activity-result preservation, durable timers, retry backoff, and visibility.
 
 Before calling this fully Temporal-like for complex business workflows, add:
 
 - deterministic workflow replay over event history;
-- durable timers;
 - signal/query APIs;
 - history compaction or continue-as-new style rollover.
 

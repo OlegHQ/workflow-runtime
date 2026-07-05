@@ -314,6 +314,106 @@ let test_mongo_kind_claim_filter_and_retry_policy () =
              Workflow_runtime.event_kind_to_string event.Workflow_runtime.kind)
            history))
 
+let test_mongo_timer_survives_and_fires_across_backend_instances () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let config =
+    Mongo_config.
+      {
+        (default ~host ~port ~database:db ()) with
+        direct_connection = true;
+        server_selection_timeout_ms = 2_000;
+        connect_timeout_ms = 2_000;
+        socket_timeout_ms = Some 5_000;
+        app_name = Some "workflow-runtime-e2e";
+      }
+  in
+  let client =
+    match
+      Mongo_eio.connect ~sw ~net:(Eio.Stdenv.net env)
+        ~clock:(Eio.Stdenv.clock env) ~config
+    with
+    | Ok client -> client
+    | Error error ->
+        Alcotest.fail ("connect: " ^ Mongo_error.to_string error)
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      let _ =
+        Mongo_eio.direct_run_command client db
+          [ ("dropDatabase", Bson.create_int32 1l) ]
+      in
+      Mongo_eio.close_direct client)
+    (fun () ->
+      let backend_a =
+        Workflow_runtime_mongo.create ~client ~db ~collection:"timer_workflows" ()
+      in
+      let backend_b =
+        Workflow_runtime_mongo.create ~client ~db ~collection:"timer_workflows" ()
+      in
+      Workflow_runtime_mongo.ensure backend_a |> expect_ok "ensure";
+      let capabilities = Workflow_runtime_mongo.capabilities backend_a in
+      Alcotest.(check bool) "durable timers" true capabilities.durable_timers;
+      Workflow_runtime_mongo.enqueue backend_a ~now_ms:4_000L (workflow "wf_timer")
+        (Workflow_runtime.enqueue_options ~run_at_ms:4_000L ())
+      |> expect_ok "enqueue";
+      let claim =
+        Workflow_runtime_mongo.claim_workflow backend_a ~workflow_id:"wf_timer"
+          ~worker_id:"timer-worker" ~now_ms:4_000L ~lease_ms:10_000L
+        |> expect_ok "claim"
+        |> Option.get
+      in
+      Alcotest.(check int) "first attempt" 1 claim.item.attempt;
+      Workflow_runtime_mongo.schedule_timer backend_a ~workflow_id:"wf_timer"
+        ~worker_id:"timer-worker" ~now_ms:4_001L ~timer_id:"sleep_1"
+        ~run_at_ms:5_000L ~payload_json:{|{"reason":"wait"}|}
+        ~message:"sleep until dependency ready" ()
+      |> expect_ok "schedule timer"
+      |> Alcotest.(check bool) "scheduled" true;
+      Alcotest.(check bool)
+        "not claimable before due" true
+        (Workflow_runtime_mongo.claim_workflow backend_b ~workflow_id:"wf_timer"
+           ~worker_id:"early-worker" ~now_ms:4_999L ~lease_ms:10_000L
+         |> expect_ok "early claim"
+         |> Option.is_none);
+      let timers =
+        Workflow_runtime_mongo.timers ~workflow_id:"wf_timer" backend_b
+        |> expect_ok "timers"
+      in
+      Alcotest.(check int) "one timer" 1 (List.length timers);
+      Alcotest.(check (option int64)) "not fired" None
+        (List.hd timers).fired_at_ms;
+      let fired =
+        Workflow_runtime_mongo.claim_workflow backend_b ~workflow_id:"wf_timer"
+          ~worker_id:"late-worker" ~now_ms:5_000L ~lease_ms:10_000L
+        |> expect_ok "late claim"
+        |> Option.get
+      in
+      Alcotest.(check int) "second attempt" 2 fired.item.attempt;
+      let timers =
+        Workflow_runtime_mongo.timers ~workflow_id:"wf_timer" backend_a
+        |> expect_ok "fired timers"
+      in
+      Alcotest.(check (option int64)) "fired" (Some 5_000L)
+        (List.hd timers).fired_at_ms;
+      let history =
+        Workflow_runtime_mongo.history ~workflow_id:"wf_timer" backend_a
+        |> expect_ok "history"
+      in
+      Alcotest.(check (list string))
+        "timer history"
+        [
+          "workflow_enqueued";
+          "workflow_claimed";
+          "timer_scheduled";
+          "timer_fired";
+          "workflow_claimed";
+        ]
+        (List.map
+           (fun event ->
+             Workflow_runtime.event_kind_to_string event.Workflow_runtime.kind)
+           history))
+
 let () =
   Mirage_crypto_rng_unix.use_default ();
   Alcotest.run "workflow-runtime-mongo"
@@ -326,5 +426,8 @@ let () =
             test_mongo_activity_results_survive_backend_instances;
           Alcotest.test_case "kind claim filter and retry policy" `Quick
             test_mongo_kind_claim_filter_and_retry_policy;
+          Alcotest.test_case "timer survives and fires across backend instances"
+            `Quick
+            test_mongo_timer_survives_and_fires_across_backend_instances;
         ] );
     ]

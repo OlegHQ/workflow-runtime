@@ -9,6 +9,7 @@ type t = {
   workflows_collection : string;
   events_collection : string;
   activity_results_collection : string;
+  timers_collection : string;
 }
 
 let create ~client ~db ~collection () =
@@ -18,6 +19,7 @@ let create ~client ~db ~collection () =
     workflows_collection = collection;
     events_collection = collection ^ "_events";
     activity_results_collection = collection ^ "_activity_results";
+    timers_collection = collection ^ "_timers";
   }
 
 let error_to_string = function
@@ -34,6 +36,7 @@ let capabilities _ =
       activity_results = true;
       task_queue_filtering = true;
       retry_backoff = true;
+      durable_timers = true;
     }
 
 let mongo_error error = `Mongo (Mongo_error.to_string error)
@@ -83,6 +86,18 @@ type activity_result_doc = {
   status : string;
   result_json : string option;
   error : string option;
+  updated_at_ms : int64;
+}
+[@@deriving bson]
+
+type timer_doc = {
+  id : string; [@bson.key "_id"]
+  timer_id : string;
+  workflow_id : string;
+  run_at_ms : int64;
+  payload_json : string option;
+  fired_at_ms : int64 option;
+  created_at_ms : int64;
   updated_at_ms : int64;
 }
 [@@deriving bson]
@@ -223,6 +238,33 @@ let activity_result_of_doc (doc : activity_result_doc) =
         updated_at_ms = doc.updated_at_ms;
       }
 
+let timer_key ~workflow_id ~timer_id = workflow_id ^ ":" ^ timer_id
+
+let timer_doc_of_timer (timer : Workflow_runtime.timer) =
+  ({
+     id = timer_key ~workflow_id:timer.workflow_id ~timer_id:timer.timer_id;
+     timer_id = timer.timer_id;
+     workflow_id = timer.workflow_id;
+     run_at_ms = timer.run_at_ms;
+     payload_json = timer.payload_json;
+     fired_at_ms = timer.fired_at_ms;
+     created_at_ms = timer.created_at_ms;
+     updated_at_ms = timer.updated_at_ms;
+   }
+    : timer_doc)
+
+let timer_of_doc (doc : timer_doc) =
+  Workflow_runtime.
+    {
+      timer_id = doc.timer_id;
+      workflow_id = doc.workflow_id;
+      run_at_ms = doc.run_at_ms;
+      payload_json = doc.payload_json;
+      fired_at_ms = doc.fired_at_ms;
+      created_at_ms = doc.created_at_ms;
+      updated_at_ms = doc.updated_at_ms;
+    }
+
 let decode_workflow_doc bson =
   match workflow_doc_of_bson_doc_result bson with
   | Error message -> Error (`Bad_document message)
@@ -242,6 +284,11 @@ let decode_activity_result bson =
   match activity_result_doc_of_bson_doc_result bson with
   | Error message -> Error (`Bad_document message)
   | Ok doc -> activity_result_of_doc doc
+
+let decode_timer bson =
+  match timer_doc_of_bson_doc_result bson with
+  | Error message -> Error (`Bad_document message)
+  | Ok doc -> Ok (timer_of_doc doc)
 
 let index_key fields =
   Bson.add_element "key" (Bson.create_doc_element (doc fields)) Bson.empty
@@ -283,6 +330,20 @@ let ensure t =
       [ Mongo_index.Name "workflow_activity_result_idx"; Mongo_index.Unique true ]
     |> Result.map_error mongo_error
   in
+  let* () =
+    Mongo_eio.direct_ensure_index t.client ~db:t.db
+      ~collection:t.timers_collection
+      (index_key [ int32 "workflow_id" 1; int32 "timer_id" 1 ])
+      [ Mongo_index.Name "workflow_timer_id_idx"; Mongo_index.Unique true ]
+    |> Result.map_error mongo_error
+  in
+  let* () =
+    Mongo_eio.direct_ensure_index t.client ~db:t.db
+      ~collection:t.timers_collection
+      (index_key [ int32 "workflow_id" 1; int32 "run_at_ms" 1 ])
+      [ Mongo_index.Name "workflow_timer_due_idx" ]
+    |> Result.map_error mongo_error
+  in
   Ok ()
 
 let event_id ~workflow_id ~sequence = workflow_id ^ ":" ^ string_of_int sequence
@@ -308,7 +369,10 @@ let append_event t ~workflow_id ~sequence ~kind ?worker_id ?payload_json ?messag
   |> Result.map (fun _ -> ())
   |> Result.map_error mongo_error
 
-let enqueue t ~now_ms workflow options =
+let timer_payload ~timer_id ~run_at_ms =
+  Printf.sprintf {|{"timer_id":%S,"run_at_ms":%Ld}|} timer_id run_at_ms
+
+let enqueue t ~now_ms workflow (options : Workflow_runtime.enqueue_options) =
   let item =
     Workflow_runtime.
       {
@@ -395,6 +459,100 @@ let claim_query ?workflow_id ?kind ~now_ms () =
             ] );
       ])
 
+let increment_event_sequence t ~workflow_id =
+  let query = doc [ string "_id" workflow_id ] in
+  let update = doc [ doc_element "$inc" (doc [ int32 "event_sequence" 1 ]) ] in
+  find_and_modify t ~query ~update
+  |> Result.map (function
+       | None -> None
+       | Some (_item, sequence) -> Some sequence)
+
+let due_timers t ~workflow_id ~now_ms =
+  let filter =
+    doc
+      [
+        string "workflow_id" workflow_id;
+        doc_element "run_at_ms" (doc [ ("$lte", Bson.create_int64 now_ms) ]);
+        ("fired_at_ms", Bson.create_null ());
+      ]
+  in
+  let opts =
+    {
+      (Mongo_crud.default_find t.timers_collection filter) with
+      sort = Some (doc [ int32 "run_at_ms" 1; int32 "timer_id" 1 ]);
+    }
+  in
+  Mongo_eio.direct_find t.client ~db:t.db ~collection:t.timers_collection opts
+  |> Result.map_error mongo_error
+  |> function
+  | Error _ as error -> error
+  | Ok docs ->
+      List.fold_left
+        (fun acc bson ->
+          match acc with
+          | Error _ as error -> error
+          | Ok timers -> (
+              match decode_timer bson with
+              | Ok timer -> Ok (timer :: timers)
+              | Error _ as error -> error))
+        (Ok []) docs
+      |> Result.map List.rev
+
+let mark_timer_fired t ~now_ms (timer : Workflow_runtime.timer) =
+  let selector =
+    doc
+      [
+        string "_id"
+          (timer_key ~workflow_id:timer.workflow_id ~timer_id:timer.timer_id);
+        ("fired_at_ms", Bson.create_null ());
+      ]
+  in
+  let update =
+    doc
+      [
+        doc_element "$set"
+          (doc [ int64 "fired_at_ms" now_ms; int64 "updated_at_ms" now_ms ]);
+      ]
+  in
+  Mongo_eio.direct_update_one t.client ~db:t.db ~collection:t.timers_collection
+    ~upsert:false selector update
+  |> Result.map_error mongo_error
+  |> Result.map (fun result -> result.Mongo_crud.matched_count = 1)
+
+let fire_due_timers t ~workflow_id ~now_ms ~first_sequence =
+  let ( let* ) = Result.bind in
+  let* timers = due_timers t ~workflow_id ~now_ms in
+  let rec loop next_sequence fired_any = function
+    | [] ->
+        if fired_any then
+          match increment_event_sequence t ~workflow_id with
+          | Error _ as error -> error
+          | Ok (Some sequence) -> Ok sequence
+          | Ok None -> Error (`Bad_document ("unknown workflow: " ^ workflow_id))
+        else Ok next_sequence
+    | timer :: rest ->
+        let* marked = mark_timer_fired t ~now_ms timer in
+        if not marked then loop next_sequence fired_any rest
+        else
+          let* () =
+            append_event t ~workflow_id ~sequence:next_sequence
+              ~kind:Workflow_runtime.Timer_fired ?payload_json:timer.payload_json
+              ~message:timer.timer_id ~occurred_at_ms:now_ms ()
+          in
+          let* next_sequence =
+            match rest with
+            | [] -> Ok next_sequence
+            | _ -> (
+                match increment_event_sequence t ~workflow_id with
+                | Error _ as error -> error
+                | Ok (Some sequence) -> Ok sequence
+                | Ok None ->
+                    Error (`Bad_document ("unknown workflow: " ^ workflow_id)))
+          in
+          loop next_sequence true rest
+  in
+  loop first_sequence false timers
+
 let claim_with_query t ~query ~worker_id ~now_ms ~lease_ms =
   let lease_expires_at_ms = Int64.add now_ms lease_ms in
   let update =
@@ -418,6 +576,9 @@ let claim_with_query t ~query ~worker_id ~now_ms ~lease_ms =
   | Ok (Some (item, sequence)) ->
       let workflow_id = item.Workflow_runtime.workflow.id in
       let ( let* ) = Result.bind in
+      let* sequence =
+        fire_due_timers t ~workflow_id ~now_ms ~first_sequence:sequence
+      in
       let* () =
         append_event t ~workflow_id ~sequence
           ~kind:Workflow_runtime.Workflow_claimed ~worker_id
@@ -567,6 +728,64 @@ let retry t ~workflow_id ~worker_id ~now_ms ~policy ~message =
                   { attempt = item.Workflow_runtime.attempt; run_at_ms }))
         else Ok None
 
+let schedule_timer t ~workflow_id ~worker_id ~now_ms ~timer_id ~run_at_ms
+    ?payload_json ~message () =
+  let timer =
+    Workflow_runtime.
+      {
+        timer_id;
+        workflow_id;
+        run_at_ms;
+        payload_json;
+        fired_at_ms = None;
+        created_at_ms = now_ms;
+        updated_at_ms = now_ms;
+      }
+  in
+  let timer_doc = timer_doc_of_timer timer in
+  let timer_update =
+    doc [ doc_element "$set" (timer_doc_to_bson_doc timer_doc) ]
+  in
+  let workflow_update =
+    doc
+      [
+        doc_element "$set"
+          (doc
+             [
+               string "status" (Workflow_runtime.status_to_string Queued);
+               int64 "run_at_ms" run_at_ms;
+               string "message" message;
+               int64 "updated_at_ms" now_ms;
+             ]);
+        doc_element "$inc" (doc [ int32 "event_sequence" 1 ]);
+        doc_element "$unset"
+          (doc
+             [
+               string "lease_owner" "";
+               string "lease_expires_at_ms" "";
+               string "finished_at_ms" "";
+             ]);
+      ]
+  in
+  let ( let* ) = Result.bind in
+  let* updated =
+    update_owned t ~workflow_id ~worker_id workflow_update
+  in
+  match updated with
+  | None -> Ok false
+  | Some sequence ->
+      let* _ =
+        Mongo_eio.direct_update_one t.client ~db:t.db
+          ~collection:t.timers_collection ~upsert:true
+          (doc [ string "_id" timer_doc.id ])
+          timer_update
+        |> Result.map_error mongo_error
+      in
+      append_event t ~workflow_id ~sequence ~kind:Workflow_runtime.Timer_scheduled
+        ~worker_id ~payload_json:(timer_payload ~timer_id ~run_at_ms) ~message
+        ~occurred_at_ms:now_ms ()
+      |> Result.map (fun () -> true)
+
 let snapshot ?tenant_id t =
   let filter =
     match tenant_id with
@@ -620,15 +839,31 @@ let history ~workflow_id t =
         (Ok []) docs
       |> Result.map List.rev
 
-let increment_event_sequence t ~workflow_id =
-  let query = doc [ string "_id" workflow_id ] in
-  let update = doc [ doc_element "$inc" (doc [ int32 "event_sequence" 1 ]) ] in
-  find_and_modify t ~query ~update
-  |> Result.map (function
-       | None -> None
-       | Some (_item, sequence) -> Some sequence)
+let timers ~workflow_id t =
+  let filter = doc [ string "workflow_id" workflow_id ] in
+  let opts =
+    {
+      (Mongo_crud.default_find t.timers_collection filter) with
+      sort = Some (doc [ int32 "run_at_ms" 1; int32 "timer_id" 1 ]);
+    }
+  in
+  Mongo_eio.direct_find t.client ~db:t.db ~collection:t.timers_collection opts
+  |> Result.map_error mongo_error
+  |> function
+  | Error _ as error -> error
+  | Ok docs ->
+      List.fold_left
+        (fun acc bson ->
+          match acc with
+          | Error _ as error -> error
+          | Ok timers -> (
+              match decode_timer bson with
+              | Ok timer -> Ok (timer :: timers)
+              | Error _ as error -> error))
+        (Ok []) docs
+      |> Result.map List.rev
 
-let record_activity_result t ~now_ms result =
+let record_activity_result t ~now_ms (result : Workflow_runtime.activity_result) =
   let result = { result with Workflow_runtime.updated_at_ms = now_ms } in
   let result_doc = activity_result_doc_of_result result in
   let update =

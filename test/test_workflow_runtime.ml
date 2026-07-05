@@ -231,6 +231,69 @@ let test_kind_claim_filter_and_retry_policy () =
   Alcotest.(check string) "failed after exhausted retries" "failed"
     (Workflow_runtime.status_to_string email_item.status)
 
+let test_durable_timer_schedules_and_fires () =
+  let now = ref 5_000L in
+  let module Runtime =
+    Workflow_runtime.Make (struct
+      let now_ms () = !now
+    end) (Workflow_runtime.Memory_backend)
+  in
+  let backend = Workflow_runtime.Memory_backend.create () in
+  Runtime.enqueue backend (workflow "timer_wf") (Workflow_runtime.enqueue_options ())
+  |> expect_ok "enqueue";
+  let claim =
+    Runtime.claim_workflow backend ~workflow_id:"timer_wf"
+      ~worker_id:"timer-worker" ~lease_ms:10_000L
+    |> expect_ok "claim"
+    |> Option.get
+  in
+  Alcotest.(check int) "first attempt" 1 claim.item.attempt;
+  Runtime.schedule_timer backend ~workflow_id:"timer_wf"
+    ~worker_id:"timer-worker" ~timer_id:"sleep_1" ~run_at_ms:7_000L
+    ~payload_json:{|{"reason":"wait"}|} ~message:"sleep until ready" ()
+  |> expect_ok "schedule timer"
+  |> Alcotest.(check bool) "timer scheduled" true;
+  Alcotest.(check bool)
+    "not claimable before timer" true
+    (Runtime.claim_workflow backend ~workflow_id:"timer_wf"
+       ~worker_id:"early-worker" ~lease_ms:10_000L
+     |> expect_ok "early claim"
+     |> Option.is_none);
+  let timers =
+    Runtime.timers backend ~workflow_id:"timer_wf" |> expect_ok "timers"
+  in
+  Alcotest.(check int) "one timer" 1 (List.length timers);
+  Alcotest.(check (option int64)) "not fired" None
+    (List.hd timers).fired_at_ms;
+  now := 7_000L;
+  let fired_claim =
+    Runtime.claim_workflow backend ~workflow_id:"timer_wf"
+      ~worker_id:"late-worker" ~lease_ms:10_000L
+    |> expect_ok "late claim"
+    |> Option.get
+  in
+  Alcotest.(check int) "second attempt after timer" 2 fired_claim.item.attempt;
+  let timers =
+    Runtime.timers backend ~workflow_id:"timer_wf" |> expect_ok "fired timers"
+  in
+  Alcotest.(check (option int64)) "fired" (Some 7_000L)
+    (List.hd timers).fired_at_ms;
+  let history =
+    Runtime.history backend ~workflow_id:"timer_wf" |> expect_ok "history"
+  in
+  Alcotest.(check (list string))
+    "timer history"
+    [
+      "workflow_enqueued";
+      "workflow_claimed";
+      "timer_scheduled";
+      "timer_fired";
+      "workflow_claimed";
+    ]
+    (List.map
+       (fun event -> Workflow_runtime.event_kind_to_string event.Workflow_runtime.kind)
+       history)
+
 let test_grouping_filtering_and_reschedule () =
   let now = ref 10L in
   let module Runtime =
@@ -309,6 +372,8 @@ let () =
             test_history_targeted_claim_and_activity_result;
           Alcotest.test_case "kind claim filter and retry policy" `Quick
             test_kind_claim_filter_and_retry_policy;
+          Alcotest.test_case "durable timer schedules and fires" `Quick
+            test_durable_timer_schedules_and_fires;
           Alcotest.test_case "grouping filtering and reschedule" `Quick
             test_grouping_filtering_and_reschedule;
           Alcotest.test_case "validation" `Quick test_validation;
