@@ -38,6 +38,12 @@ val config :
   worker_id:string ->
   unit ->
   config
+(** [config ~worker_id ()] builds worker-runner settings.
+
+    [lease_ms] and [poll_interval_ms] must be positive. [heartbeat_interval_ms]
+    must be zero to disable heartbeats, or positive and shorter than [lease_ms].
+    [worker_id] must not be empty. Raises [Invalid_argument] for invalid
+    values. *)
 
 module Make (Runtime : RUNTIME) : sig
   type backend = Runtime.backend
@@ -50,6 +56,10 @@ module Make (Runtime : RUNTIME) : sig
     config ->
     handler ->
     (run_result, error) result
+  (** Claim and run at most one workflow.
+
+      When heartbeats are enabled, loss of lease or heartbeat backend errors
+      stop the handler fiber before returning. *)
 
   val run_forever :
     clock:_ Eio.Time.clock ->

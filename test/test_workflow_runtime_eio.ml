@@ -213,6 +213,79 @@ let test_runner_heartbeats_during_handler () =
   in
   Alcotest.(check bool) "heartbeat recorded" true (heartbeat_count > 0)
 
+let test_config_rejects_invalid_values () =
+  Alcotest.check_raises "empty worker id"
+    (Invalid_argument "worker_id must not be empty")
+    (fun () ->
+      ignore (Workflow_runtime_eio.config ~worker_id:"" ()));
+  Alcotest.check_raises "bad lease"
+    (Invalid_argument "lease_ms must be positive")
+    (fun () ->
+      ignore (Workflow_runtime_eio.config ~worker_id:"runner" ~lease_ms:0L ()));
+  Alcotest.check_raises "bad poll interval"
+    (Invalid_argument "poll_interval_ms must be positive")
+    (fun () ->
+      ignore
+        (Workflow_runtime_eio.config ~worker_id:"runner" ~poll_interval_ms:0L ()));
+  Alcotest.check_raises "bad heartbeat interval"
+    (Invalid_argument "heartbeat_interval_ms must be zero or positive")
+    (fun () ->
+      ignore
+        (Workflow_runtime_eio.config ~worker_id:"runner"
+           ~heartbeat_interval_ms:(-1L) ()));
+  Alcotest.check_raises "heartbeat must fit in lease"
+    (Invalid_argument "heartbeat_interval_ms must be shorter than lease_ms")
+    (fun () ->
+      ignore
+        (Workflow_runtime_eio.config ~worker_id:"runner" ~lease_ms:100L
+           ~heartbeat_interval_ms:100L ()))
+
+let test_runner_stops_when_heartbeat_loses_lease () =
+  let now = ref 6_000L in
+  let module Runtime =
+    Workflow_runtime.Make
+      (struct
+        let now_ms () =
+          let value = !now in
+          now := Int64.add value 200L;
+          value
+      end)
+      (Workflow_runtime.Memory_backend)
+  in
+  let module Runner = Workflow_runtime_eio.Make (Runtime) in
+  let backend = Workflow_runtime.Memory_backend.create () in
+  Runtime.enqueue backend (workflow "wf_lost_lease")
+    (Workflow_runtime.enqueue_options ())
+  |> expect_ok "enqueue";
+  Eio_main.run @@ fun env ->
+  let clock = Eio.Stdenv.clock env in
+  let config =
+    Workflow_runtime_eio.config ~worker_id:"runner_a" ~lease_ms:100L
+      ~heartbeat_interval_ms:1L ()
+  in
+  let handler_finished = ref false in
+  let result =
+    Runner.run_once ~clock backend config
+      (fun (_claim : Workflow_runtime.claim) ->
+        Eio.Time.sleep clock 0.05;
+        handler_finished := true;
+        Workflow_runtime_eio.Complete
+          { status = Workflow_runtime.Succeeded; message = "too late" })
+    |> expect_ok "run once"
+  in
+  Alcotest.(check bool) "lease lost result" true
+    (match result with
+    | Workflow_runtime_eio.Lease_lost { workflow_id } ->
+        String.equal workflow_id "wf_lost_lease"
+    | _ -> false);
+  Alcotest.(check bool) "handler cancelled before side effect" false
+    !handler_finished;
+  Runtime.claim_workflow backend ~workflow_id:"wf_lost_lease"
+    ~worker_id:"runner_b" ~lease_ms:100L
+  |> expect_ok "reclaim"
+  |> Option.is_some
+  |> Alcotest.(check bool) "reclaimed after lost lease" true
+
 let () =
   Alcotest.run "workflow_runtime_eio"
     [
@@ -228,5 +301,9 @@ let () =
             test_runner_retry_exhaustion;
           Alcotest.test_case "heartbeats during handler" `Quick
             test_runner_heartbeats_during_handler;
+          Alcotest.test_case "rejects invalid config" `Quick
+            test_config_rejects_invalid_values;
+          Alcotest.test_case "stops when heartbeat loses lease" `Quick
+            test_runner_stops_when_heartbeat_loses_lease;
         ] );
     ]

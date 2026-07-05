@@ -57,6 +57,8 @@ reusable Eio worker runner over the same functorized runtime API.
 - Reusable Eio worker runner for polling, kind-filtered claims, handler
   execution, heartbeat-based lease extension, durable completion, reschedule,
   retry, and handler-failure recording.
+- Worker-runner configuration validates lease and heartbeat timings, and
+  heartbeat loss stops the handler fiber before stale work can complete.
 - Tenant-filtered and tenant-grouped snapshots.
 - Core runtime has no dependency on Eio, Dream, Mongo, or application domain
   types.

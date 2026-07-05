@@ -30,6 +30,13 @@ type run_result =
 
 let config ?kind ?(lease_ms = 30_000L) ?(poll_interval_ms = 1_000L)
     ?(heartbeat_interval_ms = 10_000L) ~worker_id () =
+  if String.equal worker_id "" then invalid_arg "worker_id must not be empty";
+  if lease_ms <= 0L then invalid_arg "lease_ms must be positive";
+  if poll_interval_ms <= 0L then invalid_arg "poll_interval_ms must be positive";
+  if heartbeat_interval_ms < 0L then
+    invalid_arg "heartbeat_interval_ms must be zero or positive";
+  if heartbeat_interval_ms >= lease_ms then
+    invalid_arg "heartbeat_interval_ms must be shorter than lease_ms";
   { worker_id; lease_ms; poll_interval_ms; heartbeat_interval_ms; kind }
 
 let seconds ms = Int64.to_float ms /. 1_000.0
@@ -47,23 +54,26 @@ module Make (Runtime : RUNTIME) = struct
 
   let protected_handler handler claim =
     try Ok (handler claim) with
+    | Eio.Cancel.Cancelled _ as exn -> raise exn
     | exn -> Error (Printexc.to_string exn)
 
-  let rec heartbeat_loop ~clock backend config (claim : Workflow_runtime.claim)
+  let rec heartbeat_guard ~clock backend config (claim : Workflow_runtime.claim)
       =
     Eio.Time.sleep clock (seconds config.heartbeat_interval_ms);
     let workflow_id = claim.item.workflow.id in
-    let _ =
+    match
       Runtime.heartbeat backend ~workflow_id ~worker_id:claim.worker_id
         ~lease_ms:config.lease_ms
-    in
-    heartbeat_loop ~clock backend config claim
+    with
+    | Ok true -> heartbeat_guard ~clock backend config claim
+    | Ok false -> Ok (Lease_lost { workflow_id })
+    | Error _ as error -> error
 
   let with_heartbeat ~clock backend config claim f =
     if config.heartbeat_interval_ms <= 0L then f ()
     else
       Eio.Fiber.first f (fun () ->
-          heartbeat_loop ~clock backend config claim)
+          heartbeat_guard ~clock backend config claim)
 
   let apply_decision backend config (claim : Workflow_runtime.claim) decision =
     let workflow_id = claim.item.workflow.id in
