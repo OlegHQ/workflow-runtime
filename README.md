@@ -21,6 +21,8 @@ reusable Eio worker runner over the same functorized runtime API.
 - Terminal completion as `succeeded`, `blocked`, or `failed`.
 - Durable cancellation as `cancelled`, including active lease release and a
   replayable `workflow_cancelled` audit event.
+- Terminal workflow history repairs missing completion/cancellation events from
+  the durable workflow document during history reads.
 - Durable reschedule back to `queued`.
 - Append-only ordered workflow event history for audit and replay inputs.
 - Activity result recording and lookup so retried workflow code can preserve

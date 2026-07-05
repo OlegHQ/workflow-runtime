@@ -1165,7 +1165,7 @@ let children ~parent_workflow_id t =
         (Ok []) children
       |> Result.map List.rev
 
-let history ~workflow_id t =
+let read_history_events ~workflow_id t =
   let filter = doc [ string "workflow_id" workflow_id ] in
   let opts =
     {
@@ -1188,6 +1188,91 @@ let history ~workflow_id t =
               | Error _ as error -> error))
         (Ok []) docs
       |> Result.map List.rev
+
+let replay_has_completion events =
+  match Workflow_runtime.replay events with
+  | Ok state -> Option.is_some state.Workflow_runtime.completion
+  | Error _ ->
+      List.exists
+        (fun (event : Workflow_runtime.event) ->
+          match event.kind with
+          | Workflow_completed | Workflow_cancelled -> true
+          | _ -> false)
+        events
+
+let find_workflow_item t ~workflow_id =
+  Mongo_eio.direct_find_one t.client ~db:t.db
+    ~collection:t.workflows_collection
+    (doc [ string "_id" workflow_id ])
+  |> Result.map_error mongo_error
+  |> function
+  | Error _ as error -> error
+  | Ok None -> Ok None
+  | Ok (Some bson) -> decode_item bson |> Result.map Option.some
+
+let find_workflow_doc t ~workflow_id =
+  Mongo_eio.direct_find_one t.client ~db:t.db
+    ~collection:t.workflows_collection
+    (doc [ string "_id" workflow_id ])
+  |> Result.map_error mongo_error
+  |> function
+  | Error _ as error -> error
+  | Ok None -> Ok None
+  | Ok (Some bson) -> decode_workflow_doc bson |> Result.map Option.some
+
+let terminal_history_event (item : Workflow_runtime.item) =
+  match item.status with
+  | Queued | Running -> None
+  | Cancelled ->
+      let reason = Option.value item.message ~default:"cancelled" in
+      Some
+        ( Workflow_runtime.Workflow_cancelled,
+          cancel_payload ~reason,
+          reason,
+          Option.value item.finished_at_ms ~default:item.updated_at_ms )
+  | Succeeded | Blocked | Failed ->
+      let message =
+        Option.value item.message
+          ~default:(Workflow_runtime.status_to_string item.status)
+      in
+      Some
+        ( Workflow_runtime.Workflow_completed,
+          completion_payload ~status:item.status ~message,
+          message,
+          Option.value item.finished_at_ms ~default:item.updated_at_ms )
+
+let repair_terminal_history t ~workflow_id events =
+  if replay_has_completion events then Ok false
+  else
+    let ( let* ) = Result.bind in
+    let* workflow_doc = find_workflow_doc t ~workflow_id in
+    let* item =
+      match workflow_doc with
+      | None -> Ok None
+      | Some doc -> item_of_workflow_doc doc |> Result.map Option.some
+    in
+    match (workflow_doc, Option.bind item terminal_history_event) with
+    | _, None -> Ok false
+    | Some doc, Some (kind, payload_json, message, occurred_at_ms) ->
+        let max_sequence =
+          List.fold_left
+            (fun max_sequence (event : Workflow_runtime.event) ->
+              max max_sequence event.sequence)
+            0 events
+        in
+        let sequence =
+          max (max_sequence + 1) (Option.value doc.event_sequence ~default:0)
+        in
+        append_event t ~workflow_id ~sequence ~kind ~payload_json ~message
+          ~occurred_at_ms ()
+        |> Result.map (fun () -> true)
+    | None, Some _ -> Ok false
+
+let history ~workflow_id t =
+  let ( let* ) = Result.bind in
+  let* events = read_history_events ~workflow_id t in
+  let* repaired = repair_terminal_history t ~workflow_id events in
+  if repaired then read_history_events ~workflow_id t else Ok events
 
 let event_exists t ~workflow_id ~kind ~payload_json =
   let ( let* ) = Result.bind in
@@ -1522,16 +1607,6 @@ let find_child_link t ~parent_workflow_id ~child_workflow_id =
   | Error _ as error -> error
   | Ok None -> Ok None
   | Ok (Some bson) -> decode_child bson |> Result.map Option.some
-
-let find_workflow_item t ~workflow_id =
-  Mongo_eio.direct_find_one t.client ~db:t.db
-    ~collection:t.workflows_collection
-    (doc [ string "_id" workflow_id ])
-  |> Result.map_error mongo_error
-  |> function
-  | Error _ as error -> error
-  | Ok None -> Ok None
-  | Ok (Some bson) -> decode_item bson |> Result.map Option.some
 
 let child_started_event_exists t ~parent_workflow_id ~child_workflow_id =
   let ( let* ) = Result.bind in

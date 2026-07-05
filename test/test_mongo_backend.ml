@@ -112,6 +112,15 @@ let test_mongo_claims_and_lease_recovery () =
       Alcotest.(check string)
         "succeeded" "succeeded"
         (Workflow_runtime.status_to_string (List.hd snapshot).status);
+      Mongo_eio.direct_delete_many client ~db ~collection:"workflows_events"
+        (bson_doc
+           [
+             bson_string "workflow_id" "wf_1";
+             bson_string "kind" "workflow_completed";
+           ])
+      |> Result.map_error (fun error -> `Mongo (Mongo_error.to_string error))
+      |> expect_ok "delete completed event"
+      |> ignore;
       let history =
         Workflow_runtime_mongo.history ~workflow_id:"wf_1" backend_a
         |> expect_ok "history"
@@ -921,6 +930,16 @@ let test_mongo_cancellation_across_backend_instances () =
         ~now_ms:7_005L ~signal_id:"late_signal" ~name:"resume" ()
       |> expect_ok "signal after cancel"
       |> Alcotest.(check bool) "signal rejected" false;
+      Mongo_eio.direct_delete_many client ~db
+        ~collection:"cancel_workflows_events"
+        (bson_doc
+           [
+             bson_string "workflow_id" "wf_cancel";
+             bson_string "kind" "workflow_cancelled";
+           ])
+      |> Result.map_error (fun error -> `Mongo (Mongo_error.to_string error))
+      |> expect_ok "delete cancelled event"
+      |> ignore;
       let snapshot =
         Workflow_runtime_mongo.snapshot backend_b |> expect_ok "snapshot"
       in
