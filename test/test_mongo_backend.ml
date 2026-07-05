@@ -28,6 +28,14 @@ let expect_ok label = function
   | Error error ->
       Alcotest.fail (label ^ ": " ^ Workflow_runtime_mongo.error_to_string error)
 
+let bson_doc fields =
+  List.fold_right (fun (name, element) acc -> Bson.add_element name element acc)
+    fields Bson.empty
+
+let bson_string name value = (name, Bson.create_string value)
+
+let bson_doc_element name value = (name, Bson.create_doc_element value)
+
 let test_mongo_claims_and_lease_recovery () =
   Eio_main.run @@ fun env ->
   Eio.Switch.run @@ fun sw ->
@@ -708,6 +716,105 @@ let test_mongo_signals_queries_and_compaction_across_backend_instances () =
       Alcotest.(check string) "claimed after signal" "wf_signal"
         claim.Workflow_runtime.item.workflow.id)
 
+let test_mongo_duplicate_messages_repair_missing_events () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let config =
+    Mongo_config.
+      {
+        (default ~host ~port ~database:db ()) with
+        direct_connection = true;
+        server_selection_timeout_ms = 2_000;
+        connect_timeout_ms = 2_000;
+        socket_timeout_ms = Some 5_000;
+        app_name = Some "workflow-runtime-e2e";
+      }
+  in
+  let client =
+    match
+      Mongo_eio.connect ~sw ~net:(Eio.Stdenv.net env)
+        ~clock:(Eio.Stdenv.clock env) ~config
+    with
+    | Ok client -> client
+    | Error error ->
+        Alcotest.fail ("connect: " ^ Mongo_error.to_string error)
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      let _ =
+        Mongo_eio.direct_run_command client db
+          [ ("dropDatabase", Bson.create_int32 1l) ]
+      in
+      Mongo_eio.close_direct client)
+    (fun () ->
+      let collection = "repair_workflows" in
+      let backend_a = Workflow_runtime_mongo.create ~client ~db ~collection () in
+      let backend_b = Workflow_runtime_mongo.create ~client ~db ~collection () in
+      Workflow_runtime_mongo.ensure backend_a |> expect_ok "ensure";
+      Workflow_runtime_mongo.enqueue backend_a ~now_ms:10_000L
+        (workflow "wf_repair")
+        (Workflow_runtime.enqueue_options ~run_at_ms:20_000L ())
+      |> expect_ok "enqueue";
+      Workflow_runtime_mongo.signal backend_a ~workflow_id:"wf_repair"
+        ~now_ms:10_001L ~signal_id:"sig_repair" ~name:"dependency_ready"
+        ~payload_json:{|{"ready":true}|} ()
+      |> expect_ok "signal"
+      |> Alcotest.(check bool) "signal accepted" true;
+      Workflow_runtime_mongo.request_update backend_a ~workflow_id:"wf_repair"
+        ~now_ms:10_002L ~update_id:"upd_repair" ~name:"change_target"
+        ~payload_json:{|{"target":"blog"}|} ()
+      |> expect_ok "request update"
+      |> Alcotest.(check bool) "update accepted" true;
+      let event_filter =
+        bson_doc
+          [
+            bson_string "workflow_id" "wf_repair";
+            bson_doc_element "kind"
+              (bson_doc
+                 [
+                   ( "$in",
+                     Bson.create_list
+                       [
+                         Bson.create_string "signal_received";
+                         Bson.create_string "update_requested";
+                       ] );
+                 ]);
+          ]
+      in
+      Mongo_eio.direct_delete_many client ~db
+        ~collection:(collection ^ "_events") event_filter
+      |> Result.map_error (fun error -> `Mongo (Mongo_error.to_string error))
+      |> expect_ok "delete events"
+      |> ignore;
+      Workflow_runtime_mongo.signal backend_b ~workflow_id:"wf_repair"
+        ~now_ms:10_003L ~signal_id:"sig_repair" ~name:"dependency_ready"
+        ~payload_json:{|{"ready":true}|} ()
+      |> expect_ok "duplicate signal repair"
+      |> Alcotest.(check bool) "signal repaired" true;
+      Workflow_runtime_mongo.request_update backend_b ~workflow_id:"wf_repair"
+        ~now_ms:10_004L ~update_id:"upd_repair" ~name:"change_target"
+        ~payload_json:{|{"target":"blog"}|} ()
+      |> expect_ok "duplicate update repair"
+      |> Alcotest.(check bool) "update repaired" true;
+      let history =
+        Workflow_runtime_mongo.history ~workflow_id:"wf_repair" backend_a
+        |> expect_ok "history"
+      in
+      Alcotest.(check (list string))
+        "repaired events"
+        [ "workflow_enqueued"; "signal_received"; "update_requested" ]
+        (List.map
+           (fun event ->
+             Workflow_runtime.event_kind_to_string event.Workflow_runtime.kind)
+           history);
+      let state =
+        Workflow_runtime_mongo.query_state ~workflow_id:"wf_repair" backend_b
+        |> expect_ok "query state"
+        |> Option.get
+      in
+      Alcotest.(check int) "one signal" 1 (List.length state.signals);
+      Alcotest.(check int) "one update" 1 (List.length state.updates))
+
 let test_mongo_cancellation_across_backend_instances () =
   Eio_main.run @@ fun env ->
   Eio.Switch.run @@ fun sw ->
@@ -1042,6 +1149,8 @@ let () =
           Alcotest.test_case
             "signals queries and compaction across backend instances" `Quick
             test_mongo_signals_queries_and_compaction_across_backend_instances;
+          Alcotest.test_case "duplicate messages repair missing events" `Quick
+            test_mongo_duplicate_messages_repair_missing_events;
           Alcotest.test_case "cancellation across backend instances" `Quick
             test_mongo_cancellation_across_backend_instances;
           Alcotest.test_case "child workflows can nest across backend instances"

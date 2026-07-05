@@ -34,6 +34,8 @@ reusable Eio worker runner over the same functorized runtime API.
 - Idempotent external workflow signals, keyed by workflow id and signal id.
 - Durable update-style request/response messages with pending, completed,
   rejected, and failed states.
+- Idempotent signal and update requests repair missing workflow-history events
+  from the durable side-table record on duplicate delivery.
 - Query APIs that replay workflow-visible state from durable history.
 - History compaction into a replayable snapshot event for long-running
   workflows.

@@ -1126,6 +1126,15 @@ let history ~workflow_id t =
         (Ok []) docs
       |> Result.map List.rev
 
+let event_exists t ~workflow_id ~kind ~payload_json =
+  let ( let* ) = Result.bind in
+  let* events = history ~workflow_id t in
+  Ok
+    (List.exists
+       (fun (event : Workflow_runtime.event) ->
+         event.kind = kind && event.payload_json = Some payload_json)
+       events)
+
 let timers ~workflow_id t =
   let filter = doc [ string "workflow_id" workflow_id ] in
   let opts =
@@ -1250,6 +1259,79 @@ let compact_history ~workflow_id t =
       |> Result.map_error mongo_error
       |> Result.map (fun _ -> Some sequence)
 
+let ensure_signal_event t ~workflow_id ~now_ms (signal : Workflow_runtime.signal) =
+  let payload_json = signal_payload signal in
+  let ( let* ) = Result.bind in
+  let* exists =
+    event_exists t ~workflow_id ~kind:Workflow_runtime.Signal_received
+      ~payload_json
+  in
+  if exists then Ok true
+  else
+    let query = doc [ string "_id" workflow_id; non_terminal_status_filter ] in
+    let update =
+      doc
+        [
+          doc_element "$set"
+            (doc
+               [
+                 string "status" (Workflow_runtime.status_to_string Queued);
+                 string "message" ("signal: " ^ signal.name);
+                 int64 "updated_at_ms" now_ms;
+               ]);
+          doc_element "$min" (doc [ int64 "run_at_ms" now_ms ]);
+          doc_element "$inc" (doc [ int32 "event_sequence" 1 ]);
+          doc_element "$unset"
+            (doc [ string "lease_owner" ""; string "lease_expires_at_ms" "" ]);
+        ]
+    in
+    find_and_modify t ~query ~update
+    |> function
+    | Error _ as error -> error
+    | Ok None -> Ok false
+    | Ok (Some (_item, sequence)) ->
+        append_event t ~workflow_id ~sequence
+          ~kind:Workflow_runtime.Signal_received ~payload_json
+          ~message:signal.name ~occurred_at_ms:now_ms ()
+        |> Result.map (fun () -> true)
+
+let ensure_update_requested_event t ~workflow_id ~now_ms
+    (update : Workflow_runtime.workflow_update) =
+  let payload_json = update_payload update in
+  let ( let* ) = Result.bind in
+  let* exists =
+    event_exists t ~workflow_id ~kind:Workflow_runtime.Update_requested
+      ~payload_json
+  in
+  if exists then Ok true
+  else
+    let query = doc [ string "_id" workflow_id; non_terminal_status_filter ] in
+    let workflow_update =
+      doc
+        [
+          doc_element "$set"
+            (doc
+               [
+                 string "status" (Workflow_runtime.status_to_string Queued);
+                 string "message" ("update: " ^ update.name);
+                 int64 "updated_at_ms" now_ms;
+               ]);
+          doc_element "$min" (doc [ int64 "run_at_ms" now_ms ]);
+          doc_element "$inc" (doc [ int32 "event_sequence" 1 ]);
+          doc_element "$unset"
+            (doc [ string "lease_owner" ""; string "lease_expires_at_ms" "" ]);
+        ]
+    in
+    find_and_modify t ~query ~update:workflow_update
+    |> function
+    | Error _ as error -> error
+    | Ok None -> Ok false
+    | Ok (Some (_item, sequence)) ->
+        append_event t ~workflow_id ~sequence
+          ~kind:Workflow_runtime.Update_requested ~payload_json
+          ~message:update.name ~occurred_at_ms:now_ms ()
+        |> Result.map (fun () -> true)
+
 let signal t ~workflow_id ~now_ms ~signal_id ~name ?payload_json () =
   let ( let* ) = Result.bind in
   let* workflow_exists =
@@ -1277,35 +1359,19 @@ let signal t ~workflow_id ~now_ms ~signal_id ~name ?payload_json () =
            ])
       |> Result.map_error mongo_error
     in
-    if signal_write.Mongo_crud.upserted_ids = [] then Ok true
-    else
-      let query = doc [ string "_id" workflow_id; non_terminal_status_filter ] in
-      let update =
-        doc
-          [
-            doc_element "$set"
-              (doc
-                 [
-                   string "status" (Workflow_runtime.status_to_string Queued);
-                   string "message" ("signal: " ^ name);
-                   int64 "updated_at_ms" now_ms;
-                 ]);
-            doc_element "$min" (doc [ int64 "run_at_ms" now_ms ]);
-            doc_element "$inc" (doc [ int32 "event_sequence" 1 ]);
-            doc_element "$unset"
-              (doc [ string "lease_owner" ""; string "lease_expires_at_ms" "" ]);
-          ]
-      in
-      find_and_modify t ~query ~update
+    if signal_write.Mongo_crud.upserted_ids = [] then
+      Mongo_eio.direct_find_one t.client ~db:t.db
+        ~collection:t.signals_collection
+        (doc [ string "_id" signal_doc.id ])
+      |> Result.map_error mongo_error
       |> function
       | Error _ as error -> error
       | Ok None -> Ok false
-      | Ok (Some (_item, sequence)) ->
-          append_event t ~workflow_id ~sequence
-            ~kind:Workflow_runtime.Signal_received
-            ~payload_json:(signal_payload signal) ~message:name
-            ~occurred_at_ms:now_ms ()
-          |> Result.map (fun () -> true)
+      | Ok (Some bson) ->
+          let* signal = decode_signal bson in
+          ensure_signal_event t ~workflow_id ~now_ms signal
+    else
+      ensure_signal_event t ~workflow_id ~now_ms signal
 
 let cancel t ~workflow_id ~now_ms ~reason =
   let query = doc [ string "_id" workflow_id; non_terminal_status_filter ] in
@@ -1499,35 +1565,19 @@ let request_update t ~workflow_id ~now_ms ~update_id ~name ?payload_json () =
         (doc [ doc_element "$setOnInsert" (workflow_update_doc_to_bson_doc update_doc) ])
       |> Result.map_error mongo_error
     in
-    if write.Mongo_crud.upserted_ids = [] then Ok true
-    else
-      let query = doc [ string "_id" workflow_id; non_terminal_status_filter ] in
-      let workflow_update =
-        doc
-          [
-            doc_element "$set"
-              (doc
-                 [
-                   string "status" (Workflow_runtime.status_to_string Queued);
-                   string "message" ("update: " ^ name);
-                   int64 "updated_at_ms" now_ms;
-                 ]);
-            doc_element "$min" (doc [ int64 "run_at_ms" now_ms ]);
-            doc_element "$inc" (doc [ int32 "event_sequence" 1 ]);
-            doc_element "$unset"
-              (doc [ string "lease_owner" ""; string "lease_expires_at_ms" "" ]);
-          ]
-      in
-      find_and_modify t ~query ~update:workflow_update
+    if write.Mongo_crud.upserted_ids = [] then
+      Mongo_eio.direct_find_one t.client ~db:t.db
+        ~collection:t.updates_collection
+        (doc [ string "_id" update_doc.id ])
+      |> Result.map_error mongo_error
       |> function
       | Error _ as error -> error
       | Ok None -> Ok false
-      | Ok (Some (_item, sequence)) ->
-          append_event t ~workflow_id ~sequence
-            ~kind:Workflow_runtime.Update_requested
-            ~payload_json:(update_payload update) ~message:name
-            ~occurred_at_ms:now_ms ()
-          |> Result.map (fun () -> true)
+      | Ok (Some bson) ->
+          let* update = decode_update bson in
+          ensure_update_requested_event t ~workflow_id ~now_ms update
+    else
+      ensure_update_requested_event t ~workflow_id ~now_ms update
 
 let complete_update t ~workflow_id ~worker_id ~now_ms ~update_id ~status
     ?result_json ?error () =
