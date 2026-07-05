@@ -7,7 +7,8 @@ claim/lease API for multi-worker execution.
 
 The API is backend-functorized. The core runtime is storage-agnostic; the
 `workflow-runtime.mongo` library supplies a MongoDB backend using `findAndModify`
-for atomic multi-instance claims.
+for atomic multi-instance claims. The `workflow-runtime.eio` library supplies a
+reusable Eio worker runner over the same functorized runtime API.
 
 ## Guarantees
 
@@ -36,6 +37,9 @@ for atomic multi-instance claims.
 - Durable child workflows: any claimed workflow can start normal child
   workflows, children can start their own children, and parent histories replay
   `child_workflow_started` events.
+- Reusable Eio worker runner for polling, kind-filtered claims, handler
+  execution, heartbeat-based lease extension, durable completion, reschedule,
+  retry, and handler-failure recording.
 - Tenant-filtered and tenant-grouped snapshots.
 - Core runtime has no dependency on Eio, Dream, Mongo, or application domain
   types.
@@ -50,7 +54,8 @@ library implements a smaller reusable foundation: durable state, atomic claims,
 task-queue filtering, leases, heartbeats, recovery, ordered event history,
 deterministic replay, activity-result preservation, durable timers, retry
 backoff, idempotent signals, durable updates, query-state replay, cancellation,
-nested child workflows, history compaction, and visibility.
+nested child workflows, history compaction, a reusable Eio worker runner, and
+visibility.
 
 Temporal still has a broader production platform surface: dedicated frontend,
 history, matching, and worker services; mature SDK workflow runners; advanced
@@ -80,16 +85,25 @@ module Runtime =
     end)
     (Workflow_runtime.Memory_backend)
 
+module Runner = Workflow_runtime_eio.Make (Runtime)
+
 let backend = Workflow_runtime.Memory_backend.create ()
 
 let () =
-  Runtime.enqueue backend workflow (Workflow_runtime.enqueue_options ()) |> ignore;
-  match Runtime.claim_next backend ~worker_id:"worker-1" ~lease_ms:30_000L with
-  | Ok (Some claim) ->
-      Runtime.complete backend ~workflow_id:claim.item.workflow.id
-        ~worker_id:"worker-1" ~status:Succeeded ~message:"published"
-      |> ignore
-  | Ok None | Error _ -> ()
+  Runtime.enqueue backend workflow (Workflow_runtime.enqueue_options ()) |> ignore
+
+let run_worker env =
+  let config =
+    Workflow_runtime_eio.config ~kind:"publish_attempt" ~worker_id:"worker-1" ()
+  in
+  Runner.run_forever ~clock:(Eio.Stdenv.clock env) backend config
+    (fun claim ->
+      (* Do idempotent side effects, using activity results for replay safety. *)
+      Workflow_runtime_eio.Complete
+        {
+          status = Workflow_runtime.Succeeded;
+          message = "published " ^ claim.item.workflow.id;
+        })
 ```
 
 ## Development

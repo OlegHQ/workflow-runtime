@@ -4,9 +4,9 @@
 
 (package
  (name workflow-runtime)
- (synopsis "Small in-process workflow observation runtime for OCaml")
+ (synopsis "Durable backend-backed workflow runtime for OCaml")
  (description
-  "workflow-runtime tracks in-process workflow lifecycle state by durable workflow id, tenant, kind, subject, and metadata, with structured and JSON snapshots.")
+  "workflow-runtime tracks durable workflow lifecycle state, worker claims, leases, replay history, timers, retries, updates, child workflows, and backend-backed execution for OCaml services.")
  (authors OlegHQ)
  (maintainers OlegHQ)
  (license MIT)

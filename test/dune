@@ -3,6 +3,10 @@
  (libraries workflow_runtime alcotest))
 
 (test
+ (name test_workflow_runtime_eio)
+ (libraries workflow_runtime workflow_runtime_eio eio_main alcotest))
+
+(test
  (name test_mongo_backend)
  (libraries
   workflow_runtime

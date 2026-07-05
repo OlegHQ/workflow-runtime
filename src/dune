@@ -5,6 +5,12 @@
  (libraries yojson threads))
 
 (library
+ (name workflow_runtime_eio)
+ (public_name workflow-runtime.eio)
+ (modules workflow_runtime_eio)
+ (libraries workflow_runtime eio))
+
+(library
  (name workflow_runtime_mongo)
  (public_name workflow-runtime.mongo)
  (modules workflow_runtime_mongo)
