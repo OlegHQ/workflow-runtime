@@ -10,6 +10,7 @@ type t = {
   events_collection : string;
   activity_results_collection : string;
   timers_collection : string;
+  signals_collection : string;
 }
 
 let create ~client ~db ~collection () =
@@ -20,6 +21,7 @@ let create ~client ~db ~collection () =
     events_collection = collection ^ "_events";
     activity_results_collection = collection ^ "_activity_results";
     timers_collection = collection ^ "_timers";
+    signals_collection = collection ^ "_signals";
   }
 
 let error_to_string = function
@@ -38,6 +40,9 @@ let capabilities _ =
       retry_backoff = true;
       durable_timers = true;
       deterministic_replay = true;
+      signals = true;
+      queries = true;
+      history_compaction = true;
     }
 
 let mongo_error error = `Mongo (Mongo_error.to_string error)
@@ -100,6 +105,16 @@ type timer_doc = {
   fired_at_ms : int64 option;
   created_at_ms : int64;
   updated_at_ms : int64;
+}
+[@@deriving bson]
+
+type signal_doc = {
+  id : string; [@bson.key "_id"]
+  signal_id : string;
+  workflow_id : string;
+  name : string;
+  payload_json : string option;
+  received_at_ms : int64;
 }
 [@@deriving bson]
 
@@ -266,6 +281,29 @@ let timer_of_doc (doc : timer_doc) =
       updated_at_ms = doc.updated_at_ms;
     }
 
+let signal_key ~workflow_id ~signal_id = workflow_id ^ ":" ^ signal_id
+
+let signal_doc_of_signal (signal : Workflow_runtime.signal) =
+  ({
+     id = signal_key ~workflow_id:signal.workflow_id ~signal_id:signal.signal_id;
+     signal_id = signal.signal_id;
+     workflow_id = signal.workflow_id;
+     name = signal.name;
+     payload_json = signal.payload_json;
+     received_at_ms = signal.received_at_ms;
+   }
+    : signal_doc)
+
+let signal_of_doc (doc : signal_doc) =
+  Workflow_runtime.
+    {
+      signal_id = doc.signal_id;
+      workflow_id = doc.workflow_id;
+      name = doc.name;
+      payload_json = doc.payload_json;
+      received_at_ms = doc.received_at_ms;
+    }
+
 let decode_workflow_doc bson =
   match workflow_doc_of_bson_doc_result bson with
   | Error message -> Error (`Bad_document message)
@@ -290,6 +328,11 @@ let decode_timer bson =
   match timer_doc_of_bson_doc_result bson with
   | Error message -> Error (`Bad_document message)
   | Ok doc -> Ok (timer_of_doc doc)
+
+let decode_signal bson =
+  match signal_doc_of_bson_doc_result bson with
+  | Error message -> Error (`Bad_document message)
+  | Ok doc -> Ok (signal_of_doc doc)
 
 let index_key fields =
   Bson.add_element "key" (Bson.create_doc_element (doc fields)) Bson.empty
@@ -345,6 +388,13 @@ let ensure t =
       [ Mongo_index.Name "workflow_timer_due_idx" ]
     |> Result.map_error mongo_error
   in
+  let* () =
+    Mongo_eio.direct_ensure_index t.client ~db:t.db
+      ~collection:t.signals_collection
+      (index_key [ int32 "workflow_id" 1; int32 "signal_id" 1 ])
+      [ Mongo_index.Name "workflow_signal_id_idx"; Mongo_index.Unique true ]
+    |> Result.map_error mongo_error
+  in
   Ok ()
 
 let event_id ~workflow_id ~sequence = workflow_id ^ ":" ^ string_of_int sequence
@@ -394,6 +444,15 @@ let activity_payload (result : Workflow_runtime.activity_result) =
       ("status", `String (Workflow_runtime.activity_status_to_string result.status));
       ("result_json", string_option_json result.result_json);
       ("error", string_option_json result.error);
+    ]
+  |> Yojson.Safe.to_string
+
+let signal_payload (signal : Workflow_runtime.signal) =
+  `Assoc
+    [
+      ("signal_id", `String signal.signal_id);
+      ("name", `String signal.name);
+      ("payload_json", string_option_json signal.payload_json);
     ]
   |> Yojson.Safe.to_string
 
@@ -888,6 +947,139 @@ let timers ~workflow_id t =
               | Error _ as error -> error))
         (Ok []) docs
       |> Result.map List.rev
+
+let signals ~workflow_id t =
+  let filter = doc [ string "workflow_id" workflow_id ] in
+  let opts =
+    {
+      (Mongo_crud.default_find t.signals_collection filter) with
+      sort = Some (doc [ int32 "received_at_ms" 1; int32 "signal_id" 1 ]);
+    }
+  in
+  Mongo_eio.direct_find t.client ~db:t.db ~collection:t.signals_collection opts
+  |> Result.map_error mongo_error
+  |> function
+  | Error _ as error -> error
+  | Ok docs ->
+      List.fold_left
+        (fun acc bson ->
+          match acc with
+          | Error _ as error -> error
+          | Ok signals -> (
+              match decode_signal bson with
+              | Ok signal -> Ok (signal :: signals)
+              | Error _ as error -> error))
+        (Ok []) docs
+      |> Result.map List.rev
+
+let query_state ~workflow_id t =
+  let ( let* ) = Result.bind in
+  let* events = history ~workflow_id t in
+  match events with
+  | [] -> Ok None
+  | events -> (
+      match Workflow_runtime.replay events with
+      | Ok state -> Ok (Some state)
+      | Error message -> Error (`Bad_document message))
+
+let compact_history ~workflow_id t =
+  let ( let* ) = Result.bind in
+  let* events = history ~workflow_id t in
+  match events with
+  | [] -> Ok None
+  | events ->
+      let* state =
+        match Workflow_runtime.replay events with
+        | Ok state -> Ok state
+        | Error message -> Error (`Bad_document message)
+      in
+      let* sequence =
+        match increment_event_sequence t ~workflow_id with
+        | Error _ as error -> error
+        | Ok (Some sequence) -> Ok sequence
+        | Ok None -> Error (`Bad_document ("unknown workflow: " ^ workflow_id))
+      in
+      let occurred_at_ms =
+        events
+        |> List.fold_left
+             (fun latest (event : Workflow_runtime.event) ->
+               Int64.max latest event.occurred_at_ms)
+             0L
+      in
+      let* () =
+        append_event t ~workflow_id ~sequence
+          ~kind:Workflow_runtime.History_compacted
+          ~payload_json:
+            (Workflow_runtime.replay_state_to_yojson state
+            |> Yojson.Safe.to_string)
+          ~message:"history compacted" ~occurred_at_ms ()
+      in
+      Mongo_eio.direct_delete_many t.client ~db:t.db
+        ~collection:t.events_collection
+        (doc
+           [
+             string "workflow_id" workflow_id;
+             doc_element "sequence" (doc [ int32 "$lt" sequence ]);
+           ])
+      |> Result.map_error mongo_error
+      |> Result.map (fun _ -> Some sequence)
+
+let signal t ~workflow_id ~now_ms ~signal_id ~name ?payload_json () =
+  let ( let* ) = Result.bind in
+  let* workflow_exists =
+    Mongo_eio.direct_find_one t.client ~db:t.db
+      ~collection:t.workflows_collection
+      (doc [ string "_id" workflow_id ])
+    |> Result.map_error mongo_error
+    |> Result.map Option.is_some
+  in
+  if not workflow_exists then Ok false
+  else
+    let signal =
+      Workflow_runtime.
+        { signal_id; workflow_id; name; payload_json; received_at_ms = now_ms }
+    in
+    let signal_doc = signal_doc_of_signal signal in
+    let* signal_write =
+      Mongo_eio.direct_update_one t.client ~db:t.db
+        ~collection:t.signals_collection ~upsert:true
+        (doc [ string "_id" signal_doc.id ])
+        (doc
+           [
+             doc_element "$setOnInsert"
+               (signal_doc_to_bson_doc signal_doc);
+           ])
+      |> Result.map_error mongo_error
+    in
+    if signal_write.Mongo_crud.upserted_ids = [] then Ok true
+    else
+      let query = doc [ string "_id" workflow_id ] in
+      let update =
+        doc
+          [
+            doc_element "$set"
+              (doc
+                 [
+                   string "status" (Workflow_runtime.status_to_string Queued);
+                   string "message" ("signal: " ^ name);
+                   int64 "updated_at_ms" now_ms;
+                 ]);
+            doc_element "$min" (doc [ int64 "run_at_ms" now_ms ]);
+            doc_element "$inc" (doc [ int32 "event_sequence" 1 ]);
+            doc_element "$unset"
+              (doc [ string "lease_owner" ""; string "lease_expires_at_ms" "" ]);
+          ]
+      in
+      find_and_modify t ~query ~update
+      |> function
+      | Error _ as error -> error
+      | Ok None -> Ok false
+      | Ok (Some (_item, sequence)) ->
+          append_event t ~workflow_id ~sequence
+            ~kind:Workflow_runtime.Signal_received
+            ~payload_json:(signal_payload signal) ~message:name
+            ~occurred_at_ms:now_ms ()
+          |> Result.map (fun () -> true)
 
 let record_activity_result t ~now_ms (result : Workflow_runtime.activity_result) =
   let result = { result with Workflow_runtime.updated_at_ms = now_ms } in

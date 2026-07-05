@@ -24,7 +24,11 @@ for atomic multi-instance claims.
 - Durable timers that release the worker lease, persist wake-up metadata, and
   append `timer_fired` before the resumed claim.
 - Pure deterministic replay over event history for workflow-visible completion,
-  timer, and activity-result state.
+  timer, activity-result, and signal state.
+- Idempotent external workflow signals, keyed by workflow id and signal id.
+- Query APIs that replay workflow-visible state from durable history.
+- History compaction into a replayable snapshot event for long-running
+  workflows.
 - Tenant-filtered and tenant-grouped snapshots.
 - Core runtime has no dependency on Eio, Dream, Mongo, or application domain
   types.
@@ -38,12 +42,15 @@ preservation, durable timers, retries, timeouts, and worker polling. This
 library implements a smaller reusable foundation: durable state, atomic claims,
 task-queue filtering, leases, heartbeats, recovery, ordered event history,
 deterministic replay, activity-result preservation, durable timers, retry
-backoff, and visibility.
+backoff, idempotent signals, query-state replay, history compaction, and
+visibility.
 
-Before calling this fully Temporal-like for complex business workflows, add:
-
-- signal/query APIs;
-- history compaction or continue-as-new style rollover.
+Temporal still has a broader production platform surface: dedicated frontend,
+history, matching, and worker services; mature SDK workflow runners; updates;
+cancellation; child workflows; advanced visibility; archival; multi-cluster
+operation; and managed cloud options. Use this library when Poster needs an
+embedded OCaml workflow foundation over its existing Mongo deployment. Use
+Temporal when the system needs the full external orchestration platform.
 
 ## Minimal Example
 

@@ -56,6 +56,9 @@ type backend_capabilities = {
   retry_backoff : bool;
   durable_timers : bool;
   deterministic_replay : bool;
+  signals : bool;
+  queries : bool;
+  history_compaction : bool;
 }
 
 type event_kind =
@@ -70,6 +73,8 @@ type event_kind =
   | Activity_failed
   | Timer_scheduled
   | Timer_fired
+  | Signal_received
+  | History_compacted
 
 type event = {
   id : string;
@@ -103,6 +108,14 @@ type timer = {
   fired_at_ms : int64 option;
   created_at_ms : int64;
   updated_at_ms : int64;
+}
+
+type signal = {
+  signal_id : string;
+  workflow_id : string;
+  name : string;
+  payload_json : string option;
+  received_at_ms : int64;
 }
 
 type retry_policy = {
@@ -146,6 +159,8 @@ type replay_state = {
   completion : replay_completion option;
   timers : replay_timer list;
   activities : replay_activity list;
+  signals : signal list;
+  compacted_at_sequence : int option;
 }
 
 val enqueue_options :
@@ -169,6 +184,7 @@ val item_to_yojson : item -> Yojson.Safe.t
 val event_to_yojson : event -> Yojson.Safe.t
 val activity_result_to_yojson : activity_result -> Yojson.Safe.t
 val timer_to_yojson : timer -> Yojson.Safe.t
+val signal_to_yojson : signal -> Yojson.Safe.t
 val replay_state_to_yojson : replay_state -> Yojson.Safe.t
 val items_to_yojson : ?group_by_tenant:bool -> item list -> Yojson.Safe.t
 val stats : item list -> stats
@@ -247,9 +263,22 @@ module type BACKEND = sig
     unit ->
     (bool, error) result
 
+  val signal :
+    t ->
+    workflow_id:string ->
+    now_ms:int64 ->
+    signal_id:string ->
+    name:string ->
+    ?payload_json:string ->
+    unit ->
+    (bool, error) result
+
   val snapshot : ?tenant_id:string -> t -> (item list, error) result
   val history : workflow_id:string -> t -> (event list, error) result
   val timers : workflow_id:string -> t -> (timer list, error) result
+  val signals : workflow_id:string -> t -> (signal list, error) result
+  val query_state : workflow_id:string -> t -> (replay_state option, error) result
+  val compact_history : workflow_id:string -> t -> (int option, error) result
 
   val record_activity_result :
     t -> now_ms:int64 -> activity_result -> (unit, error) result
@@ -330,10 +359,22 @@ module type S = sig
     unit ->
     (bool, error) result
 
+  val signal :
+    backend ->
+    workflow_id:string ->
+    signal_id:string ->
+    name:string ->
+    ?payload_json:string ->
+    unit ->
+    (bool, error) result
+
   val snapshot : ?tenant_id:string -> backend -> (item list, error) result
   val snapshot_json : ?tenant_id:string -> ?group_by_tenant:bool -> backend -> (Yojson.Safe.t, error) result
   val history : workflow_id:string -> backend -> (event list, error) result
   val timers : workflow_id:string -> backend -> (timer list, error) result
+  val signals : workflow_id:string -> backend -> (signal list, error) result
+  val query_state : workflow_id:string -> backend -> (replay_state option, error) result
+  val compact_history : workflow_id:string -> backend -> (int option, error) result
 
   val record_activity_result :
     backend -> activity_result -> (unit, error) result

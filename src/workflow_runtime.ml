@@ -49,6 +49,9 @@ type backend_capabilities = {
   retry_backoff : bool;
   durable_timers : bool;
   deterministic_replay : bool;
+  signals : bool;
+  queries : bool;
+  history_compaction : bool;
 }
 
 type event_kind =
@@ -63,6 +66,8 @@ type event_kind =
   | Activity_failed
   | Timer_scheduled
   | Timer_fired
+  | Signal_received
+  | History_compacted
 
 type event = {
   id : string;
@@ -96,6 +101,14 @@ type timer = {
   fired_at_ms : int64 option;
   created_at_ms : int64;
   updated_at_ms : int64;
+}
+
+type signal = {
+  signal_id : string;
+  workflow_id : string;
+  name : string;
+  payload_json : string option;
+  received_at_ms : int64;
 }
 
 type retry_policy = {
@@ -139,6 +152,8 @@ type replay_state = {
   completion : replay_completion option;
   timers : replay_timer list;
   activities : replay_activity list;
+  signals : signal list;
+  compacted_at_sequence : int option;
 }
 
 let enqueue_options ?(run_at_ms = 0L) ?payload_json () =
@@ -184,6 +199,8 @@ let event_kind_to_string = function
   | Activity_failed -> "activity_failed"
   | Timer_scheduled -> "timer_scheduled"
   | Timer_fired -> "timer_fired"
+  | Signal_received -> "signal_received"
+  | History_compacted -> "history_compacted"
 
 let event_kind_of_string = function
   | "workflow_enqueued" -> Ok Workflow_enqueued
@@ -197,6 +214,8 @@ let event_kind_of_string = function
   | "activity_failed" -> Ok Activity_failed
   | "timer_scheduled" -> Ok Timer_scheduled
   | "timer_fired" -> Ok Timer_fired
+  | "signal_received" -> Ok Signal_received
+  | "history_compacted" -> Ok History_compacted
   | value -> Error ("unknown workflow event kind: " ^ value)
 
 let activity_status_to_string = function
@@ -320,6 +339,16 @@ let timer_to_yojson (timer : timer) =
       ("updated_at_ms", int64_json timer.updated_at_ms);
     ]
 
+let signal_to_yojson (signal : signal) =
+  `Assoc
+    [
+      ("signal_id", `String signal.signal_id);
+      ("workflow_id", `String signal.workflow_id);
+      ("name", `String signal.name);
+      ("payload_json", string_option_json signal.payload_json);
+      ("received_at_ms", int64_json signal.received_at_ms);
+    ]
+
 let replay_completion_to_yojson (completion : replay_completion) =
   `Assoc
     [
@@ -359,6 +388,9 @@ let replay_state_to_yojson (state : replay_state) =
         option_json replay_completion_to_yojson state.completion );
       ("timers", `List (List.map replay_timer_to_yojson state.timers));
       ("activities", `List (List.map replay_activity_to_yojson state.activities));
+      ("signals", `List (List.map signal_to_yojson state.signals));
+      ( "compacted_at_sequence",
+        option_json (fun value -> `Int value) state.compacted_at_sequence );
     ]
 
 let completion_payload ~status ~message =
@@ -389,6 +421,15 @@ let activity_payload (result : activity_result) =
     ]
   |> Yojson.Safe.to_string
 
+let signal_payload (signal : signal) =
+  `Assoc
+    [
+      ("signal_id", `String signal.signal_id);
+      ("name", `String signal.name);
+      ("payload_json", string_option_json signal.payload_json);
+    ]
+  |> Yojson.Safe.to_string
+
 let empty_replay_state =
   {
     workflow_id = None;
@@ -397,7 +438,129 @@ let empty_replay_state =
     completion = None;
     timers = [];
     activities = [];
+    signals = [];
+    compacted_at_sequence = None;
   }
+
+let replay_state_of_yojson json =
+  let ( let* ) = Result.bind in
+  let list_member json name decode =
+    match Yojson.Safe.Util.member name json with
+    | `Null -> Ok []
+    | `List values ->
+        List.fold_left
+          (fun acc value ->
+            match acc with
+            | Error _ as error -> error
+            | Ok values ->
+                let* decoded = decode value in
+                Ok (decoded :: values))
+          (Ok []) values
+        |> Result.map List.rev
+    | _ -> Error ("expected list field: " ^ name)
+  in
+  let workflow_id =
+    match Yojson.Safe.Util.member "workflow_id" json with
+    | `Null -> Ok None
+    | `String value -> Ok (Some value)
+    | _ -> Error "expected workflow_id string or null"
+  in
+  let enqueued_at_ms =
+    match Yojson.Safe.Util.member "enqueued_at_ms" json with
+    | `Null -> Ok None
+    | value ->
+        int64_member (`Assoc [ ("value", value) ]) "value" |> Result.map Option.some
+  in
+  let claim_count =
+    match Yojson.Safe.Util.member "claim_count" json with
+    | `Null -> Ok 0
+    | `Int value -> Ok value
+    | _ -> Error "expected claim_count int"
+  in
+  let completion =
+    match Yojson.Safe.Util.member "completion" json with
+    | `Null -> Ok None
+    | value ->
+        let* status =
+          let* status = string_member value "status" in
+          status_of_string status
+        in
+        let* message = string_option_member value "message" in
+        let* completed_at_ms = int64_member value "completed_at_ms" in
+        Ok (Some { status; message; completed_at_ms })
+  in
+  let timers =
+    list_member json "timers" (fun value ->
+        let* timer_id = string_member value "timer_id" in
+        let* run_at_ms = int64_member value "run_at_ms" in
+        let* scheduled_at_ms = int64_member value "scheduled_at_ms" in
+        let fired_at_ms =
+          match Yojson.Safe.Util.member "fired_at_ms" value with
+          | `Null -> Ok None
+          | value ->
+              int64_member (`Assoc [ ("value", value) ]) "value"
+              |> Result.map Option.some
+        in
+        let* fired_at_ms = fired_at_ms in
+        Ok { timer_id; run_at_ms; scheduled_at_ms; fired_at_ms })
+  in
+  let activities =
+    list_member json "activities" (fun value ->
+        let* activity_id = string_member value "activity_id" in
+        let* name = string_member value "name" in
+        let* attempt = int_member value "attempt" in
+        let* status =
+          let* status = string_member value "status" in
+          activity_status_of_string status
+        in
+        let* result_json = string_option_member value "result_json" in
+        let* error = string_option_member value "error" in
+        let* completed_at_ms = int64_member value "completed_at_ms" in
+        Ok
+          {
+            activity_id;
+            name;
+            attempt;
+            status;
+            result_json;
+            error;
+            completed_at_ms;
+          })
+  in
+  let signals =
+    list_member json "signals" (fun value ->
+        let* signal_id = string_member value "signal_id" in
+        let* workflow_id = string_member value "workflow_id" in
+        let* name = string_member value "name" in
+        let* payload_json = string_option_member value "payload_json" in
+        let* received_at_ms = int64_member value "received_at_ms" in
+        Ok { signal_id; workflow_id; name; payload_json; received_at_ms })
+  in
+  let compacted_at_sequence =
+    match Yojson.Safe.Util.member "compacted_at_sequence" json with
+    | `Null -> Ok None
+    | `Int value -> Ok (Some value)
+    | _ -> Error "expected compacted_at_sequence int or null"
+  in
+  let* workflow_id = workflow_id in
+  let* enqueued_at_ms = enqueued_at_ms in
+  let* claim_count = claim_count in
+  let* completion = completion in
+  let* timers = timers in
+  let* activities = activities in
+  let* signals = signals in
+  let* compacted_at_sequence = compacted_at_sequence in
+  Ok
+    {
+      workflow_id;
+      enqueued_at_ms;
+      claim_count;
+      completion;
+      timers;
+      activities;
+      signals;
+      compacted_at_sequence;
+    }
 
 let upsert_timer timers timer =
   timer :: List.filter (fun existing -> not (String.equal existing.timer_id timer.timer_id)) timers
@@ -421,6 +584,11 @@ let replay_event state (event : event) =
   in
   let state = { state with workflow_id } in
   match event.kind with
+  | History_compacted ->
+      let ( let* ) = Result.bind in
+      let* json = payload_json event in
+      let* compacted = replay_state_of_yojson json in
+      Ok { compacted with compacted_at_sequence = Some event.sequence }
   | Workflow_enqueued ->
       Ok { state with enqueued_at_ms = Some event.occurred_at_ms }
   | Workflow_claimed ->
@@ -490,6 +658,27 @@ let replay_event state (event : event) =
                    not (String.equal existing.activity_id activity_id))
                  state.activities;
         }
+  | Signal_received ->
+      let ( let* ) = Result.bind in
+      let* json = payload_json event in
+      let* signal_id = string_member json "signal_id" in
+      let* name = string_member json "name" in
+      let* payload_json = string_option_member json "payload_json" in
+      Ok
+        {
+          state with
+          signals =
+            {
+              signal_id;
+              workflow_id = event.workflow_id;
+              name;
+              payload_json;
+              received_at_ms = event.occurred_at_ms;
+            }
+            :: List.filter
+                 (fun existing -> not (String.equal existing.signal_id signal_id))
+                 state.signals;
+        }
   | Workflow_heartbeat | Workflow_rescheduled | Activity_scheduled
   | Activity_started ->
       Ok state
@@ -522,6 +711,10 @@ let replay events =
                  (fun left right ->
                    String.compare left.activity_id right.activity_id)
                  state.activities;
+             signals =
+               List.sort
+                 (fun left right -> String.compare left.signal_id right.signal_id)
+                 state.signals;
            })
   with Invalid_argument message -> Error message
 
@@ -654,9 +847,22 @@ module type BACKEND = sig
     unit ->
     (bool, error) result
 
+  val signal :
+    t ->
+    workflow_id:string ->
+    now_ms:int64 ->
+    signal_id:string ->
+    name:string ->
+    ?payload_json:string ->
+    unit ->
+    (bool, error) result
+
   val snapshot : ?tenant_id:string -> t -> (item list, error) result
   val history : workflow_id:string -> t -> (event list, error) result
   val timers : workflow_id:string -> t -> (timer list, error) result
+  val signals : workflow_id:string -> t -> (signal list, error) result
+  val query_state : workflow_id:string -> t -> (replay_state option, error) result
+  val compact_history : workflow_id:string -> t -> (int option, error) result
 
   val record_activity_result :
     t -> now_ms:int64 -> activity_result -> (unit, error) result
@@ -737,10 +943,22 @@ module type S = sig
     unit ->
     (bool, error) result
 
+  val signal :
+    backend ->
+    workflow_id:string ->
+    signal_id:string ->
+    name:string ->
+    ?payload_json:string ->
+    unit ->
+    (bool, error) result
+
   val snapshot : ?tenant_id:string -> backend -> (item list, error) result
   val snapshot_json : ?tenant_id:string -> ?group_by_tenant:bool -> backend -> (Yojson.Safe.t, error) result
   val history : workflow_id:string -> backend -> (event list, error) result
   val timers : workflow_id:string -> backend -> (timer list, error) result
+  val signals : workflow_id:string -> backend -> (signal list, error) result
+  val query_state : workflow_id:string -> backend -> (replay_state option, error) result
+  val compact_history : workflow_id:string -> backend -> (int option, error) result
 
   val record_activity_result :
     backend -> activity_result -> (unit, error) result
@@ -769,9 +987,15 @@ module Make (Clock : CLOCK) (Backend : BACKEND) = struct
   let schedule_timer backend ~workflow_id ~worker_id ~timer_id ~run_at_ms ?payload_json ~message () =
     Backend.schedule_timer backend ~workflow_id ~worker_id ~now_ms:(Clock.now_ms ())
       ~timer_id ~run_at_ms ?payload_json ~message ()
+  let signal backend ~workflow_id ~signal_id ~name ?payload_json () =
+    Backend.signal backend ~workflow_id ~now_ms:(Clock.now_ms ()) ~signal_id
+      ~name ?payload_json ()
   let snapshot = Backend.snapshot
   let history = Backend.history
   let timers = Backend.timers
+  let signals = Backend.signals
+  let query_state = Backend.query_state
+  let compact_history = Backend.compact_history
   let record_activity_result backend result =
     Backend.record_activity_result backend ~now_ms:(Clock.now_ms ()) result
   let find_activity_result = Backend.find_activity_result
@@ -795,6 +1019,7 @@ module Memory_backend = struct
     events : (string, event list) Hashtbl.t;
     activity_results : (string, activity_result) Hashtbl.t;
     timers : (string, timer) Hashtbl.t;
+    signals : (string, signal) Hashtbl.t;
   }
 
   let create () =
@@ -804,6 +1029,7 @@ module Memory_backend = struct
       events = Hashtbl.create 128;
       activity_results = Hashtbl.create 128;
       timers = Hashtbl.create 128;
+      signals = Hashtbl.create 128;
     }
 
   let error_to_string = function
@@ -826,10 +1052,14 @@ module Memory_backend = struct
       retry_backoff = true;
       durable_timers = false;
       deterministic_replay = true;
+      signals = true;
+      queries = true;
+      history_compaction = true;
     }
 
   let activity_key ~workflow_id ~activity_id = workflow_id ^ "\000" ^ activity_id
   let timer_key ~workflow_id ~timer_id = workflow_id ^ "\000" ^ timer_id
+  let signal_key ~workflow_id ~signal_id = workflow_id ^ "\000" ^ signal_id
 
   let append_event record ~workflow_id ~kind ?worker_id ?payload_json ?message
       ~occurred_at_ms t =
@@ -1151,6 +1381,86 @@ module Memory_backend = struct
                let by_due = Int64.compare a.run_at_ms b.run_at_ms in
                if by_due <> 0 then by_due else String.compare a.timer_id b.timer_id)
         |> Result.ok)
+
+  let signals ~workflow_id t =
+    with_lock t (fun () ->
+        t.signals |> Hashtbl.to_seq_values |> List.of_seq
+        |> List.filter (fun (signal : signal) -> String.equal signal.workflow_id workflow_id)
+        |> List.sort (fun (a : signal) (b : signal) ->
+               Int64.compare a.received_at_ms b.received_at_ms)
+        |> Result.ok)
+
+  let query_state ~workflow_id t =
+    with_lock t (fun () ->
+        let events =
+          Hashtbl.find_opt t.events workflow_id
+          |> Option.value ~default:[]
+          |> List.sort (fun a b -> Int.compare a.sequence b.sequence)
+        in
+        if events = [] then Ok None
+        else
+          match replay events with
+          | Ok state -> Ok (Some state)
+          | Error message -> Error (`Invalid_workflow message))
+
+  let compact_history ~workflow_id t =
+    with_lock t (fun () ->
+        match Hashtbl.find_opt t.records workflow_id with
+        | None -> Ok None
+        | Some record ->
+            let events =
+              Hashtbl.find_opt t.events workflow_id
+              |> Option.value ~default:[]
+              |> List.sort (fun a b -> Int.compare a.sequence b.sequence)
+            in
+            match replay events with
+            | Error message -> Error (`Invalid_workflow message)
+            | Ok state ->
+                let sequence = record.event_sequence + 1 in
+                record.event_sequence <- sequence;
+                let event =
+                  {
+                    id = workflow_id ^ ":" ^ string_of_int sequence;
+                    workflow_id;
+                    sequence;
+                    kind = History_compacted;
+                    worker_id = None;
+                    payload_json =
+                      Some (replay_state_to_yojson state |> Yojson.Safe.to_string);
+                    message = Some "history compacted";
+                    occurred_at_ms = record.item.updated_at_ms;
+                  }
+                in
+                Hashtbl.replace t.events workflow_id [ event ];
+                Ok (Some sequence))
+
+  let signal t ~workflow_id ~now_ms ~signal_id ~name ?payload_json () =
+    with_lock t (fun () ->
+        match Hashtbl.find_opt t.records workflow_id with
+        | None -> Ok false
+        | Some record ->
+            let key = signal_key ~workflow_id ~signal_id in
+            if Hashtbl.mem t.signals key then Ok true
+            else
+            let signal =
+              { signal_id; workflow_id; name; payload_json; received_at_ms = now_ms }
+            in
+            Hashtbl.replace t.signals key signal;
+            let item = record.item in
+            record.item <-
+              {
+                item with
+                status = Queued;
+                run_at_ms = min item.run_at_ms now_ms;
+                lease_owner = None;
+                lease_expires_at_ms = None;
+                message = Some ("signal: " ^ name);
+                updated_at_ms = now_ms;
+              };
+            append_event record ~workflow_id ~kind:Signal_received
+              ~payload_json:(signal_payload signal) ~message:name
+              ~occurred_at_ms:now_ms t;
+            Ok true)
 
   let record_activity_result t ~now_ms (result : activity_result) =
     with_lock t (fun () ->

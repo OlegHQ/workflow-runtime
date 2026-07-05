@@ -323,6 +323,99 @@ let test_durable_timer_schedules_and_fires () =
   Alcotest.(check (option int64)) "replay timer fired" (Some 7_000L)
     timer.fired_at_ms
 
+let test_signals_queries_and_history_compaction () =
+  let now = ref 10_000L in
+  let module Runtime =
+    Workflow_runtime.Make (struct
+      let now_ms () =
+        let value = !now in
+        now := Int64.add value 1L;
+        value
+    end) (Workflow_runtime.Memory_backend)
+  in
+  let backend = Workflow_runtime.Memory_backend.create () in
+  let capabilities = Runtime.capabilities backend in
+  Alcotest.(check bool) "signals" true capabilities.signals;
+  Alcotest.(check bool) "queries" true capabilities.queries;
+  Alcotest.(check bool) "history compaction" true
+    capabilities.history_compaction;
+  Runtime.enqueue backend (workflow "signal_wf") (Workflow_runtime.enqueue_options ())
+  |> expect_ok "enqueue";
+  Runtime.claim_workflow backend ~workflow_id:"signal_wf" ~worker_id:"worker_a"
+    ~lease_ms:10_000L
+  |> expect_ok "claim"
+  |> Option.get
+  |> ignore;
+  Runtime.record_activity_result backend
+    Workflow_runtime.
+      {
+        activity_id = "prepare_payload";
+        workflow_id = "signal_wf";
+        name = "prepare payload";
+        attempt = 1;
+        status = Activity_succeeded;
+        result_json = Some {|{"ok":true}|};
+        error = None;
+        updated_at_ms = 0L;
+      }
+  |> expect_ok "record activity";
+  Runtime.schedule_timer backend ~workflow_id:"signal_wf" ~worker_id:"worker_a"
+    ~timer_id:"wait_for_auth" ~run_at_ms:20_000L ~message:"wait" ()
+  |> expect_ok "schedule timer"
+  |> Alcotest.(check bool) "timer scheduled" true;
+  Runtime.signal backend ~workflow_id:"signal_wf" ~signal_id:"sig_1"
+    ~name:"auth_ready" ~payload_json:{|{"account":"personal"}|} ()
+  |> expect_ok "signal"
+  |> Alcotest.(check bool) "signal accepted" true;
+  Runtime.signal backend ~workflow_id:"signal_wf" ~signal_id:"sig_1"
+    ~name:"auth_ready" ~payload_json:{|{"account":"personal"}|} ()
+  |> expect_ok "duplicate signal"
+  |> Alcotest.(check bool) "duplicate accepted idempotently" true;
+  let state =
+    Runtime.query_state backend ~workflow_id:"signal_wf"
+    |> expect_ok "query state"
+    |> Option.get
+  in
+  Alcotest.(check int) "query activities" 1 (List.length state.activities);
+  Alcotest.(check int) "query timers" 1 (List.length state.timers);
+  Alcotest.(check int) "query signals" 1 (List.length state.signals);
+  let signal = List.hd state.signals in
+  Alcotest.(check string) "signal name" "auth_ready" signal.name;
+  Alcotest.(check (option string)) "signal payload"
+    (Some {|{"account":"personal"}|})
+    signal.payload_json;
+  Runtime.compact_history backend ~workflow_id:"signal_wf"
+  |> expect_ok "compact"
+  |> Option.get
+  |> ignore;
+  let compacted_history =
+    Runtime.history backend ~workflow_id:"signal_wf" |> expect_ok "history"
+  in
+  Alcotest.(check (list string))
+    "compacted history"
+    [ "history_compacted" ]
+    (List.map
+       (fun event -> Workflow_runtime.event_kind_to_string event.Workflow_runtime.kind)
+       compacted_history);
+  let compacted_state =
+    Runtime.query_state backend ~workflow_id:"signal_wf"
+    |> expect_ok "query compacted"
+    |> Option.get
+  in
+  Alcotest.(check int) "compacted activities" 1
+    (List.length compacted_state.activities);
+  Alcotest.(check int) "compacted timers" 1
+    (List.length compacted_state.timers);
+  Alcotest.(check int) "compacted signals" 1
+    (List.length compacted_state.signals);
+  Runtime.claim_workflow backend ~workflow_id:"signal_wf" ~worker_id:"worker_b"
+    ~lease_ms:10_000L
+  |> expect_ok "claim after signal"
+  |> Option.get
+  |> fun claim ->
+  Alcotest.(check string) "claimed after signal" "signal_wf"
+    claim.Workflow_runtime.item.workflow.id
+
 let test_grouping_filtering_and_reschedule () =
   let now = ref 10L in
   let module Runtime =
@@ -403,6 +496,8 @@ let () =
             test_kind_claim_filter_and_retry_policy;
           Alcotest.test_case "durable timer schedules and fires" `Quick
             test_durable_timer_schedules_and_fires;
+          Alcotest.test_case "signals queries and history compaction" `Quick
+            test_signals_queries_and_history_compaction;
           Alcotest.test_case "grouping filtering and reschedule" `Quick
             test_grouping_filtering_and_reschedule;
           Alcotest.test_case "validation" `Quick test_validation;

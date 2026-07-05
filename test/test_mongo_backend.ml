@@ -445,6 +445,138 @@ let test_mongo_timer_survives_and_fires_across_backend_instances () =
       Alcotest.(check (option int64)) "replay fired" (Some 5_000L)
         timer.fired_at_ms)
 
+let test_mongo_signals_queries_and_compaction_across_backend_instances () =
+  Eio_main.run @@ fun env ->
+  Eio.Switch.run @@ fun sw ->
+  let config =
+    Mongo_config.
+      {
+        (default ~host ~port ~database:db ()) with
+        direct_connection = true;
+        server_selection_timeout_ms = 2_000;
+        connect_timeout_ms = 2_000;
+        socket_timeout_ms = Some 5_000;
+        app_name = Some "workflow-runtime-e2e";
+      }
+  in
+  let client =
+    match
+      Mongo_eio.connect ~sw ~net:(Eio.Stdenv.net env)
+        ~clock:(Eio.Stdenv.clock env) ~config
+    with
+    | Ok client -> client
+    | Error error ->
+        Alcotest.fail ("connect: " ^ Mongo_error.to_string error)
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      let _ =
+        Mongo_eio.direct_run_command client db
+          [ ("dropDatabase", Bson.create_int32 1l) ]
+      in
+      Mongo_eio.close_direct client)
+    (fun () ->
+      let backend_a =
+        Workflow_runtime_mongo.create ~client ~db ~collection:"signal_workflows" ()
+      in
+      let backend_b =
+        Workflow_runtime_mongo.create ~client ~db ~collection:"signal_workflows" ()
+      in
+      Workflow_runtime_mongo.ensure backend_a |> expect_ok "ensure";
+      let capabilities = Workflow_runtime_mongo.capabilities backend_a in
+      Alcotest.(check bool) "signals" true capabilities.signals;
+      Alcotest.(check bool) "queries" true capabilities.queries;
+      Alcotest.(check bool) "history compaction" true
+        capabilities.history_compaction;
+      Workflow_runtime_mongo.enqueue backend_a ~now_ms:6_000L
+        (workflow "wf_signal")
+        (Workflow_runtime.enqueue_options ~run_at_ms:6_000L ())
+      |> expect_ok "enqueue";
+      Workflow_runtime_mongo.claim_workflow backend_a ~workflow_id:"wf_signal"
+        ~worker_id:"worker_a" ~now_ms:6_001L ~lease_ms:10_000L
+      |> expect_ok "claim"
+      |> Option.get
+      |> ignore;
+      Workflow_runtime_mongo.record_activity_result backend_a ~now_ms:6_002L
+        Workflow_runtime.
+          {
+            activity_id = "prepare_payload";
+            workflow_id = "wf_signal";
+            name = "prepare payload";
+            attempt = 1;
+            status = Activity_succeeded;
+            result_json = Some {|{"ok":true}|};
+            error = None;
+            updated_at_ms = 0L;
+          }
+      |> expect_ok "record activity";
+      Workflow_runtime_mongo.schedule_timer backend_a ~workflow_id:"wf_signal"
+        ~worker_id:"worker_a" ~now_ms:6_003L ~timer_id:"wait_for_auth"
+        ~run_at_ms:20_000L ~message:"wait for external auth" ()
+      |> expect_ok "schedule timer"
+      |> Alcotest.(check bool) "timer scheduled" true;
+      Workflow_runtime_mongo.signal backend_b ~workflow_id:"wf_signal"
+        ~now_ms:6_004L ~signal_id:"sig_1" ~name:"auth_ready"
+        ~payload_json:{|{"account":"personal"}|} ()
+      |> expect_ok "signal"
+      |> Alcotest.(check bool) "signal accepted" true;
+      Workflow_runtime_mongo.signal backend_a ~workflow_id:"wf_signal"
+        ~now_ms:6_005L ~signal_id:"sig_1" ~name:"auth_ready"
+        ~payload_json:{|{"account":"personal"}|} ()
+      |> expect_ok "duplicate signal"
+      |> Alcotest.(check bool) "duplicate accepted idempotently" true;
+      let signals =
+        Workflow_runtime_mongo.signals ~workflow_id:"wf_signal" backend_a
+        |> expect_ok "signals"
+      in
+      Alcotest.(check int) "stored signals" 1 (List.length signals);
+      let state =
+        Workflow_runtime_mongo.query_state ~workflow_id:"wf_signal" backend_b
+        |> expect_ok "query state"
+        |> Option.get
+      in
+      Alcotest.(check int) "query activities" 1 (List.length state.activities);
+      Alcotest.(check int) "query timers" 1 (List.length state.timers);
+      Alcotest.(check int) "query signals" 1 (List.length state.signals);
+      let signal = List.hd state.signals in
+      Alcotest.(check string) "signal name" "auth_ready" signal.name;
+      Alcotest.(check (option string)) "signal payload"
+        (Some {|{"account":"personal"}|})
+        signal.payload_json;
+      Workflow_runtime_mongo.compact_history ~workflow_id:"wf_signal" backend_b
+      |> expect_ok "compact"
+      |> Option.get
+      |> ignore;
+      let compacted_history =
+        Workflow_runtime_mongo.history ~workflow_id:"wf_signal" backend_a
+        |> expect_ok "compacted history"
+      in
+      Alcotest.(check (list string))
+        "history compacted"
+        [ "history_compacted" ]
+        (List.map
+           (fun event ->
+             Workflow_runtime.event_kind_to_string event.Workflow_runtime.kind)
+           compacted_history);
+      let compacted_state =
+        Workflow_runtime_mongo.query_state ~workflow_id:"wf_signal" backend_a
+        |> expect_ok "query compacted"
+        |> Option.get
+      in
+      Alcotest.(check int) "compacted activities" 1
+        (List.length compacted_state.activities);
+      Alcotest.(check int) "compacted timers" 1
+        (List.length compacted_state.timers);
+      Alcotest.(check int) "compacted signals" 1
+        (List.length compacted_state.signals);
+      Workflow_runtime_mongo.claim_workflow backend_a ~workflow_id:"wf_signal"
+        ~worker_id:"worker_b" ~now_ms:6_006L ~lease_ms:10_000L
+      |> expect_ok "claim after signal"
+      |> Option.get
+      |> fun claim ->
+      Alcotest.(check string) "claimed after signal" "wf_signal"
+        claim.Workflow_runtime.item.workflow.id)
+
 let () =
   Mirage_crypto_rng_unix.use_default ();
   Alcotest.run "workflow-runtime-mongo"
@@ -460,5 +592,8 @@ let () =
           Alcotest.test_case "timer survives and fires across backend instances"
             `Quick
             test_mongo_timer_survives_and_fires_across_backend_instances;
+          Alcotest.test_case
+            "signals queries and compaction across backend instances" `Quick
+            test_mongo_signals_queries_and_compaction_across_backend_instances;
         ] );
     ]
